@@ -4,7 +4,7 @@
 
 [**→ Use it now**](https://lostwhen.github.io/daimon/)
 
-Daimon takes a `.json` army list exported from [ListForge](https://listforge.club) or any app that uses the [BattleScribe roster schema](http://www.battlescribe.net/schema/rosterSchema) and converts it into an import file for [UnitCrunch](https://www.unitcrunch.com/), the 40K probability and damage simulator.
+Daimon takes a `.json` army list exported from [ListForge](https://listforge.club), [New Recruit](https://www.newrecruit.eu/), or any app that uses the [BattleScribe roster schema](http://www.battlescribe.net/schema/rosterSchema) and converts it into an import file for [UnitCrunch](https://www.unitcrunch.com/), the 40K probability and damage simulator.
 
 No server, no account, no data leaves your browser. Drop a file in, get a file out.
 
@@ -12,7 +12,7 @@ No server, no account, no data leaves your browser. Drop a file in, get a file o
 
 ## Quick Start
 
-1. Export your army list as `.json` from **ListForge** (or another BSData-compatible app that exports JSON — see [Compatibility](#compatibility))
+1. Export your army list as `.json` from **ListForge**, **New Recruit**, or another BSData-compatible app (see [Compatibility](#compatibility))
 2. Open **[Daimon](https://lostwhen.github.io/daimon/)**
 3. Drop the `.json` file onto the page (or click to browse)
 4. A `.txt` file downloads automatically
@@ -26,7 +26,7 @@ Daimon reads any JSON file that follows the BattleScribe roster schema (`http://
 | App | Export Format | Works with Daimon |
 |-----|-------------|-------------------|
 | [ListForge](https://listforge.club) | JSON | ✓ Tested extensively |
-| [New Recruit](https://www.newrecruit.eu/) | JSON | Expected (same schema, not yet tested — [report results](https://github.com/LostWhen/daimon/issues)) |
+| [New Recruit](https://www.newrecruit.eu/) | JSON | ✓ Tested — see [Validation](#validation) |
 | BattleScribe | XML (`.ros` / `.rosz`) | ✗ Not supported — BattleScribe exports XML, not JSON |
 
 If you test Daimon with an app not listed here, please open an issue with your results.
@@ -64,7 +64,7 @@ Some abilities are game-state-dependent and can't be automatically converted. Af
 - **Mortal wound output** — Abilities that inflict mortal wounds (on charge, on death, etc.) aren't mapped since UC models attack sequences, not event triggers.
 - **Movement and deployment** — Deep Strike, Advance bonuses, transport capacity — not relevant to damage simulation.
 - **Board-state auras** — "While within 6″ of this model" effects require positioning context UC doesn't have.
-- **Enhancements** — Detected but stat modifications from enhancements are suppressed because BSData bakes enhancement bonuses directly into weapon profiles already.
+- **Enhancements** — Enhancement points are correctly included in profile totals. Stat modifications from enhancements are detected but suppressed because BSData bakes enhancement bonuses directly into weapon and unit stat profiles already. Enhancement ability descriptions are preserved for reference.
 
 ## Validation
 
@@ -96,6 +96,20 @@ All testing was done with competitive 2000-point lists using specific detachment
 
 Additional testing from earlier development validated 254 profiles across 7 army files including Necrons, Custodes, and Drukhari — see the [session handoff document](https://github.com/LostWhen/daimon/wiki) for full history.
 
+**New Recruit compatibility testing** (v0.73.22 — 7 NR exports covering 7 factions, all invulnerable saves cross-referenced against [Wahapedia](https://wahapedia.ru/)):
+
+| Faction | Source | Profiles | Weapons | Abilities | Invulns |
+|---------|--------|----------|---------|-----------|---------|
+| Chaos Daemons | NR | 11 | 20 | 6 | 11/11 |
+| Blood Angels | NR | 11 | 27 | 28 | 4/4 |
+| Death Guard | NR | 12 | 26 | 23 | 8/8 |
+| Grey Knights | NR | 8 | 19 | 12 | 4/4 |
+| Imperial Knights | NR | 6 | 27 | 14 | 6/6 |
+| Tyranids | NR | 13 | 25 | 24 | 4/4 |
+| Orks | NR | 15 | 44 | 26 | 15/15 |
+
+**Combined NR:** 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zero errors. Enhancement points (9 units) correctly summed from upgrade children. Enhanced unit variants correctly deduplicated as separate profiles.
+
 ## Technical Details
 
 - Single HTML file (~93KB), zero external dependencies
@@ -109,6 +123,20 @@ Additional testing from earlier development validated 254 profiles across 7 army
 *Daimon* — from Walter Jon Williams' novel [*Aristoi*](https://en.wikipedia.org/wiki/Aristoi_(novel)) (1992). The Aristoi partition their consciousness into daimones: specialized sub-processes that each handle a single task autonomously. This tool is a daimon — one job, one transformation, done.
 
 ## Version History
+
+### v0.73.22
+
+**New Recruit compatibility + enhancement points fix.**
+
+Two bugs fixed, both additive — zero existing lines removed or modified.
+
+**1. Invulnerable save extraction (NR-specific):** New Recruit uses five different formats for invulnerable save ability profiles, none of which matched Daimon's existing regex patterns. `extractInvulnSave` now handles all NR formats: bare value (`$text: "4+"`), parenthesized name (`"Invulnerable Save (4+)"`), sentence descriptions (`"This model has a 4+ invulnerable save."`), unit-wide sentences (`"Models in this unit have a 5+ invulnerable save."`), and named variants (`"Invulnerable Save: Fluxmaster"`). This also fixed two wrong-value bugs where text fallbacks were grabbing invulnerable save values from unrelated aura or faction rule text (Zoanthropes: was 6+, should be 4+; Trukk: was 5+, should be 6+).
+
+**2. Enhancement points (NR + ListForge):** BSData stores enhancement costs as separate `costs` entries on upgrade child selections, not summed into the parent unit cost. `processSelectionUnit` now sums costs from direct `type=upgrade` children. This also fixes deduplication of enhanced unit variants — previously three Lords of Change at 270/300/280pts were collapsed into one profile at 270pts because their fingerprints were identical without the enhancement cost.
+
+**Affected units:** 25 dropped invulns and 2 wrong values across 7 NR files. 14 units with incorrect points across both NR (9) and ListForge (5) exports. All invulnerable save values verified against Wahapedia datasheets.
+
+**Validated:** 76 NR profiles + 6 ListForge files regression tested. Zero errors, zero regressions.
 
 ### v0.73.21
 
