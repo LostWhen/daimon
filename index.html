@@ -1,0 +1,2104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Daimon — BSData → UnitCrunch Converter</title>
+<meta name="description" content="Convert Warhammer 40K army lists from ListForge (BSData JSON) into UnitCrunch import files. Runs entirely in your browser.">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+  h1 {
+    font-size: 1.6rem;
+    margin-bottom: 0.3rem;
+    color: #e94560;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 1.5rem;
+  }
+  #drop-zone {
+    width: 100%;
+    max-width: 600px;
+    border: 2px dashed #555;
+    border-radius: 12px;
+    padding: 3rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: #16213e;
+    position: relative;
+  }
+  #drop-zone.dragover {
+    border-color: #e94560;
+    background: #1a1a3e;
+    transform: scale(1.02);
+  }
+  #drop-zone .icon { font-size: 2.5rem; margin-bottom: 0.8rem; }
+  #drop-zone p { color: #aaa; font-size: 0.95rem; }
+  #drop-zone p strong { color: #e94560; }
+  #file-input { display: none; }
+  #log {
+    width: 100%;
+    max-width: 600px;
+    margin-top: 1.5rem;
+    background: #0f3460;
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    max-height: 400px;
+    overflow-y: auto;
+    display: none;
+  }
+  #log .info { color: #7ec8e3; }
+  #log .success { color: #4ecca3; }
+  #log .error { color: #e94560; }
+  #log .unit { color: #c4b5fd; }
+</style>
+</head>
+<body>
+
+<h1>Daimon</h1>
+<p class="subtitle">BSData → UnitCrunch Converter — Drop a ListForge / New Recruit JSON export to convert — v0.73.20</p>
+
+<div id="drop-zone">
+  <div class="icon">&#128196;</div>
+  <p>Drag &amp; drop <strong>.json</strong> here<br>or click to browse</p>
+</div>
+<input type="file" id="file-input" accept=".json">
+
+<div id="log"></div>
+
+<script>
+// ── Minimal MessagePack encoder ──────────────────────────────────────────────
+const msgpack = (() => {
+  function encode(value) {
+    const parts = [];
+    _encode(value, parts);
+    const total = parts.reduce((s, p) => s + p.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    return out;
+  }
+
+  function _encode(val, parts) {
+    if (val === null || val === undefined) {
+      parts.push(new Uint8Array([0xc0]));
+    } else if (typeof val === 'boolean') {
+      parts.push(new Uint8Array([val ? 0xc3 : 0xc2]));
+    } else if (typeof val === 'number') {
+      if (Number.isInteger(val)) {
+        encodeInt(val, parts);
+      } else {
+        encodeFloat64(val, parts);
+      }
+    } else if (typeof val === 'string') {
+      encodeString(val, parts);
+    } else if (Array.isArray(val)) {
+      encodeArray(val, parts);
+    } else if (typeof val === 'object') {
+      encodeMap(val, parts);
+    }
+  }
+
+  function encodeInt(n, parts) {
+    if (n >= 0) {
+      if (n <= 0x7f) {
+        parts.push(new Uint8Array([n]));
+      } else if (n <= 0xff) {
+        parts.push(new Uint8Array([0xcc, n]));
+      } else if (n <= 0xffff) {
+        parts.push(new Uint8Array([0xcd, (n >> 8) & 0xff, n & 0xff]));
+      } else if (n <= 0xffffffff) {
+        parts.push(new Uint8Array([0xce, (n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]));
+      } else {
+        // uint64 (0xCF) for integers > 32-bit (e.g. Date.now() timestamps)
+        // JavaScript integers are safe up to 2^53-1
+        const hi = Math.floor(n / 0x100000000);
+        const lo = n >>> 0;
+        const buf = new ArrayBuffer(9);
+        const view = new DataView(buf);
+        view.setUint8(0, 0xcf);
+        view.setUint32(1, hi);
+        view.setUint32(5, lo);
+        parts.push(new Uint8Array(buf));
+      }
+    } else {
+      if (n >= -32) {
+        parts.push(new Uint8Array([n & 0xff]));
+      } else if (n >= -128) {
+        parts.push(new Uint8Array([0xd0, n & 0xff]));
+      } else if (n >= -32768) {
+        const buf = new ArrayBuffer(3);
+        const view = new DataView(buf);
+        view.setUint8(0, 0xd1);
+        view.setInt16(1, n);
+        parts.push(new Uint8Array(buf));
+      } else if (n >= -2147483648) {
+        const buf = new ArrayBuffer(5);
+        const view = new DataView(buf);
+        view.setUint8(0, 0xd2);
+        view.setInt32(1, n);
+        parts.push(new Uint8Array(buf));
+      } else {
+        encodeFloat64(n, parts);
+      }
+    }
+  }
+
+  function encodeFloat64(n, parts) {
+    const buf = new ArrayBuffer(9);
+    const view = new DataView(buf);
+    view.setUint8(0, 0xcb);
+    view.setFloat64(1, n);
+    parts.push(new Uint8Array(buf));
+  }
+
+  function encodeString(s, parts) {
+    const encoded = new TextEncoder().encode(s);
+    const len = encoded.length;
+    if (len <= 31) {
+      parts.push(new Uint8Array([0xa0 | len]));
+    } else if (len <= 0xff) {
+      parts.push(new Uint8Array([0xd9, len]));
+    } else if (len <= 0xffff) {
+      parts.push(new Uint8Array([0xda, (len >> 8) & 0xff, len & 0xff]));
+    } else {
+      parts.push(new Uint8Array([0xdb, (len >>> 24) & 0xff, (len >>> 16) & 0xff, (len >>> 8) & 0xff, len & 0xff]));
+    }
+    parts.push(encoded);
+  }
+
+  function encodeArray(arr, parts) {
+    const len = arr.length;
+    if (len <= 15) {
+      parts.push(new Uint8Array([0x90 | len]));
+    } else if (len <= 0xffff) {
+      parts.push(new Uint8Array([0xdc, (len >> 8) & 0xff, len & 0xff]));
+    } else {
+      parts.push(new Uint8Array([0xdd, (len >>> 24) & 0xff, (len >>> 16) & 0xff, (len >>> 8) & 0xff, len & 0xff]));
+    }
+    for (const item of arr) _encode(item, parts);
+  }
+
+  function encodeMap(obj, parts) {
+    const keys = Object.keys(obj);
+    const len = keys.length;
+    if (len <= 15) {
+      parts.push(new Uint8Array([0x80 | len]));
+    } else if (len <= 0xffff) {
+      parts.push(new Uint8Array([0xde, (len >> 8) & 0xff, len & 0xff]));
+    } else {
+      parts.push(new Uint8Array([0xdf, (len >>> 24) & 0xff, (len >>> 16) & 0xff, (len >>> 8) & 0xff, len & 0xff]));
+    }
+    for (const k of keys) {
+      _encode(k, parts);
+      _encode(obj[k], parts);
+    }
+  }
+
+  return { encode };
+})();
+
+// ── Effect Builder Helpers (matched to UnitCrunch v0.73.17 export format) ────
+
+// Build a reroll effect matching UC's reRoll structure
+// rollKey: "hitRoll" | "woundRoll" | "damage"
+// rollTitle: "Hit roll" | "Wound roll" | "Damage"
+// resultType: "allFailed" | "ones"
+// resultType: "allFailed" | "ones"
+// Verified field-for-field against UC v0.73.17 exports:
+//   "allFailed" → resultToReRoll.key: "allPossibleFailures" (verified 2026-02-22)
+//   "ones"      → resultToReRoll.key: "single", valueSingle: 1 (verified 2026-02-22 from attacker preset export)
+function makeRerollEffect(rollKey, rollTitle, resultType) {
+  if (resultType === "ones") {
+    return {
+      text: "Re-roll", type: "reRoll",
+      data: {
+        application: { title: rollTitle, key: rollKey },
+        limit: { title: "None", key: "none" },
+        resultToReRoll: { title: "Single", key: "single" },
+        valueRange: [], valueSingle: 1
+      }
+    };
+  }
+  // allFailed
+  return {
+    text: "Re-roll", type: "reRoll",
+    data: {
+      application: { title: rollTitle, key: rollKey },
+      limit: { title: "None", key: "none" },
+      resultToReRoll: { title: "All possible failures", key: "allPossibleFailures" },
+      valueRange: [], valueSingle: null
+    }
+  };
+}
+
+// Build a sustained/extra hits effect matching UC's generateExtras structure
+function makeSustainedEffect(value) {
+  return {
+    text: "Generate extras", type: "generateExtras",
+    data: { option: { title: "Extra hits", key: "extraHits" }, extrasValue: String(value) }
+  };
+}
+
+// ── Keyword → UnitCrunch Ability Map ─────────────────────────────────────────
+const KEYWORD_ABILITY_MAP = {
+  "lethal hits": {
+    description: "Critical hit : automatically wounds",
+    aliases: [{ name: "Lethal hits", type: "reserved" }],
+    conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+    effect: { text: "Automatically wound", type: "automaticallyWound", data: {} },
+    scope: ["weapon"]
+  },
+  "sustained hits 1": {
+    description: "Critical hit : 1 extra hit",
+    aliases: [{ name: "Sustained hits 1", type: "reserved" }],
+    conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+    effect: makeSustainedEffect(1),
+    scope: ["weapon"]
+  },
+  "sustained hits 2": {
+    description: "Critical hit : 2 extra hits",
+    aliases: [{ name: "Sustained hits 2", type: "reserved" }],
+    conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+    effect: makeSustainedEffect(2),
+    scope: ["weapon"]
+  },
+  "sustained hits d3": {
+    description: "Critical hit : D3 extra hits",
+    aliases: [{ name: "Sustained hits D3", type: "reserved" }],
+    conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+    effect: makeSustainedEffect("D3"),
+    scope: ["weapon"]
+  },
+  "devastating wounds": {
+    description: "Critical wound : mortal wounds equal to weapon damage (attack sequence ends) (no spill over)",
+    aliases: [{ name: "Devastating wounds", type: "reserved" }],
+    conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical wound", key: "woundRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+    effect: { text: "Mortal wounds", type: "mortalWounds", data: { attackSequenceEnds: true, cap: null, matchWeaponDamage: true, mortalWoundsValue: null, noSpillOver: true } },
+    scope: ["weapon"]
+  },
+  "torrent": {
+    description: "Automatically hits",
+    aliases: [{ name: "Torrent", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Automatically hit", type: "automaticallyHit", data: {} },
+    scope: ["weapon"]
+  },
+  "twin-linked": {
+    description: "Re-roll wound rolls",
+    aliases: [{ name: "Twin-linked", type: "reserved" }],
+    conditions: [],
+    effect: makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
+    scope: ["weapon"]
+  },
+  "lance": {
+    description: "+1 to wound roll (if unit charged this turn)",
+    aliases: [{ name: "Lance", type: "reserved" }],
+    conditions: [{ text: "Unit charged", type: "unitCharged", data: {}, description: "Whether the unit charged this turn.", preselected: false }],
+    effect: { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+    scope: ["weapon"]
+  },
+  "psychic": {
+    description: "Psychic",
+    aliases: [{ name: "Psychic", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: { option: { title: "Psychic", key: "psychic" } } },
+    scope: ["weapon"]
+  },
+  "ignores cover": {
+    description: "Ignores cover",
+    aliases: [{ name: "Ignores cover", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Ignore armour save modifier", type: "ignoreArmour", data: { ignoreArmourSaveModifier: true } },
+    scope: ["weapon"]
+  },
+  "precision": {
+    description: "Precision (on critical hit, can allocate attack to character)",
+    aliases: [{ name: "Precision", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "blast": {
+    description: "Blast (+1 attack per 5 models in target unit)",
+    aliases: [{ name: "Blast", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "hazardous": {
+    description: "Hazardous (after resolving, roll D6: on 1, suffer 3 mortal wounds)",
+    aliases: [{ name: "Hazardous", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "indirect fire": {
+    description: "Indirect Fire (can target non-visible units; -1 to hit, benefit of cover)",
+    aliases: [{ name: "Indirect fire", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "assault": {
+    description: "Assault (can be shot after advancing)",
+    aliases: [{ name: "Assault", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "heavy": {
+    description: "Heavy (+1 to hit if unit remained stationary)",
+    aliases: [{ name: "Heavy", type: "reserved" }],
+    conditions: [{ text: "Unit remained stationary", type: "unitStationary", data: {}, description: "Whether the unit remained stationary.", preselected: false }],
+    effect: { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+    scope: ["weapon"]
+  },
+  "rapid fire 1": {
+    description: "Increase attacks by 1 (within half range)",
+    aliases: [{ name: "Rapid fire 1", type: "reserved" }],
+    conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+    effect: { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: "1", applyToExtraAttacks: false } },
+    scope: ["weapon"]
+  },
+  "rapid fire 2": {
+    description: "Increase attacks by 2 (within half range)",
+    aliases: [{ name: "Rapid fire 2", type: "reserved" }],
+    conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+    effect: { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: "2", applyToExtraAttacks: false } },
+    scope: ["weapon"]
+  },
+  "rapid fire d3": {
+    description: "Increase attacks by D3 (within half range)",
+    aliases: [{ name: "Rapid fire D3", type: "reserved" }],
+    conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+    effect: { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: "D3", applyToExtraAttacks: false } },
+    scope: ["weapon"]
+  },
+  "extra attacks": {
+    description: "Extra Attacks (attacks with this weapon are made in addition to other weapons)",
+    aliases: [{ name: "Extra attacks", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "pistol": {
+    description: "Pistol (can be shot even within Engagement Range)",
+    aliases: [{ name: "Pistol", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "one shot": {
+    description: "One Shot (can only be shot once per battle)",
+    aliases: [{ name: "One shot", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "linked fire": {
+    description: "Linked Fire (faction-specific: Fire Prisms can combine shots)",
+    aliases: [{ name: "Linked fire", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  },
+  "reverberating summons": {
+    description: "Reverberating Summons (faction-specific: summon additional units)",
+    aliases: [{ name: "Reverberating summons", type: "reserved" }],
+    conditions: [],
+    effect: { text: "Special", type: "special", data: {} },
+    scope: ["weapon"]
+  }
+};
+
+// ── Ability Text → UnitCrunch Ability Parsers ───────────────────────────────
+// Each parser receives {name, description, source} and returns a UnitCrunch
+// ability object (or null). source is "ability"|"rule"|"enhancement".
+// Abilities go on the unit, not individual weapons.
+
+function makeUnitAbility(name, description, conditions, effect, scope) {
+  return {
+    id: genUUID(),
+    aliases: [{ name, type: "custom" }],
+    aliasActive: true,
+    conditions: conditions || [],
+    description,
+    effect,
+    scope: scope || ["unit"],
+    sharedWithAllUnits: false
+  };
+}
+
+// Extract bracket keywords like [LETHAL HITS], [SUSTAINED HITS D3] from text
+function extractBracketKeywords(text) {
+  text = (text || "").replace(/\u00A0/g, ' ');
+  const results = [];
+  const re = /\[([A-Za-z][A-Za-z0-9 /'+]+)\]/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    results.push(m[1].trim().toUpperCase());
+  }
+  return results;
+}
+
+// Convert a bracket keyword to a unit-scope ability using KEYWORD_ABILITY_MAP
+function bracketKeywordToAbility(keyword, contextName) {
+  const kwLower = keyword.toLowerCase().replace(/\s+/g, ' ');
+  // Direct match
+  if (KEYWORD_ABILITY_MAP[kwLower]) {
+    const t = KEYWORD_ABILITY_MAP[kwLower];
+    return makeUnitAbility(
+      `${contextName}: ${t.aliases[0].name}`,
+      `${contextName}: ${t.description}`,
+      t.conditions,
+      t.effect,
+      ["unit"]
+    );
+  }
+  // Anti-X pattern
+  const antiMatch = kwLower.match(/anti[- ](\w+)\s+(\d+)\+/);
+  if (antiMatch) {
+    const target = antiMatch[1].toUpperCase();
+    const threshold = parseInt(antiMatch[2], 10);
+    return makeUnitAbility(
+      `${contextName}: Anti-${target} ${threshold}+`,
+      `${contextName}: Critical wound on ${threshold}+ (vs ${target})`,
+      [{ text: "Keyword", type: "keyword", data: { keyword: target }, description: `Target has ${target} keyword.`, preselected: false }],
+      { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWound" }, absoluteValue: threshold } },
+      ["unit"]
+    );
+  }
+  // Melta X
+  const meltaMatch = kwLower.match(/melta\s+(\d+)/);
+  if (meltaMatch) {
+    const mVal = parseInt(meltaMatch[1], 10);
+    return makeUnitAbility(
+      `${contextName}: Melta ${mVal}`,
+      `${contextName}: +${mVal} to damage (within half range)`,
+      [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: mVal } },
+      ["unit"]
+    );
+  }
+  return null;
+}
+
+// Master list of text-pattern parsers
+const ABILITY_PARSERS = [
+
+  // ── Feel No Pain X+ (from rules) ───────────────────────────────────────────
+  function parseFNP(name, desc) {
+    // Standard rule format: name = "Feel No Pain 5+"
+    const m = name.match(/^Feel No Pain (\d+)\+$/i);
+    if (m) {
+      const val = parseInt(m[1], 10);
+      return makeUnitAbility(
+        `Feel No Pain ${val}+`,
+        `Feel No Pain ${val}+`,
+        [],
+        { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
+        ["unit"]
+      );
+    }
+    // Ability profile format: name = "Feel No Pain", desc = "5+" or "4+"
+    if (/^Feel No Pain$/i.test(name)) {
+      const md = desc.match(/^(\d+)\+$/);
+      if (md) {
+        const val = parseInt(md[1], 10);
+        return makeUnitAbility(
+          `Feel No Pain ${val}+`,
+          `Feel No Pain ${val}+`,
+          [],
+          { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
+          ["unit"]
+        );
+      }
+    }
+    return null;
+  },
+
+  // ── Conditional FNP (against Psychic Attacks / mortal wounds) ───────────────
+  // e.g. "Feel No Pain 3+ ability against Psychic Attacks and mortal wounds"
+  // e.g. "Feel No Pain 4+ ability against mortal wounds and Psychic Attacks"
+  function parseConditionalFNP(name, desc) {
+    const m = desc.match(/Feel No Pain (\d)\+ ability against/i);
+    if (!m) return null;
+    const val = parseInt(m[1], 10);
+    const hasPsychic = /Psychic/i.test(desc);
+    const hasMortal = /mortal wound/i.test(desc);
+    const label = hasPsychic && hasMortal ? 'vs Psychic & mortals' : hasPsychic ? 'vs Psychic' : hasMortal ? 'vs mortals' : 'conditional';
+    const ability = makeUnitAbility(
+      `${name}: FNP ${val}+ (${label})`,
+      `${name}: Feel No Pain ${val}+ against ${hasPsychic ? 'Psychic Attacks' : ''}${hasPsychic && hasMortal ? ' and ' : ''}${hasMortal ? 'mortal wounds' : ''}`,
+      [],
+      { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
+      ["unit"]
+    );
+    // These are always conditional (only vs specific damage types) — start inactive for toggle
+    ability.aliasActive = false;
+    return ability;
+  },
+
+  // ── FNP embedded in ability description (leader grants, once-per-battle, etc.) ─
+  // e.g. "While this model is leading a unit, models in that unit have the Feel No Pain 5+ ability"
+  // e.g. "Once per battle...models in this unit have the Feel No Pain 4+ ability"
+  // Catches FNP values under any ability name (Rites of Reanimation, Living Fortress, etc.)
+  // Skips if already caught by parseFNP or parseConditionalFNP (the "against" qualifier)
+  function parseFNPFromDescription(name, desc) {
+    // Skip if this is the conditional FNP pattern (already handled above)
+    if (/Feel No Pain \d\+ ability against/i.test(desc)) return null;
+    // Skip if this IS the standard "Feel No Pain X+" rule (already handled by parseFNP)
+    if (/^Feel No Pain \d+\+$/i.test(name)) return null;
+    if (/^Feel No Pain$/i.test(name)) return null;
+
+    const m = desc.match(/have (?:the )?Feel No Pain (\d)\+ ability/i);
+    if (!m) return null;
+    const val = parseInt(m[1], 10);
+
+    // Determine if always-on (leader aura) or conditional (once-per-battle, etc.)
+    const isLeaderAura = /while this model is leading/i.test(desc);
+    const isConditional = /once per battle|until the end of the phase|until the end of the turn/i.test(desc);
+
+    const ability = makeUnitAbility(
+      `${name}: FNP ${val}+`,
+      `${name}: Feel No Pain ${val}+${isLeaderAura ? ' (while leading)' : ''}${isConditional ? ' (conditional)' : ''}`,
+      [],
+      { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
+      ["unit"]
+    );
+    // Conditional/once-per-battle effects start inactive
+    if (isConditional && !isLeaderAura) ability.aliasActive = false;
+    return ability;
+  },
+
+  // ── Stealth (from rules) ────────────────────────────────────────────────────
+  function parseStealth(name, desc) {
+    if (name !== "Stealth") return null;
+    return makeUnitAbility(
+      "Stealth",
+      "-1 to hit roll (ranged attacks targeting this unit)",
+      [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false }],
+      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+      ["unit"]
+    );
+  },
+
+  // ── Damaged: X wounds remaining → -1 to hit ────────────────────────────────
+  function parseDamaged(name, desc) {
+    const m = name.match(/^Damaged:\s*(\d+)-(\d+)\s*wounds?\s*remaining$/i);
+    if (!m) return null;
+    if (/subtract 1 from the Hit roll/i.test(desc)) {
+      return makeUnitAbility(
+        name,
+        "When damaged: -1 to hit rolls",
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Re-roll hit rolls of 1 ─────────────────────────────────────────────────
+  function parseRerollHit1(name, desc) {
+    if (/re-roll a Hit roll of 1/i.test(desc) && !/re-roll the Hit roll instead/i.test(desc)) {
+      // Simple reroll 1s, no conditional upgrade
+      const rangedOnly = /ranged attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc);
+      const conditions = [];
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+
+      // Check for conditional target (MONSTER/VEHICLE)
+      const targetMatch = desc.match(/targets?\s+(?:a\s+)?(MONSTER|VEHICLE|MONSTER or VEHICLE|VEHICLE or MONSTER)\s+unit/i);
+      if (targetMatch) {
+        const kws = targetMatch[1].toUpperCase().split(/\s+or\s+/i);
+        for (const kw of kws) {
+          conditions.push({ text: "Keyword", type: "keyword", data: { keyword: kw.trim() }, description: `Target has ${kw.trim()} keyword.`, preselected: false });
+        }
+      }
+
+      return makeUnitAbility(
+        `${name}: Re-roll hit 1s`,
+        `${name}: Re-roll hit rolls of 1${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
+        conditions,
+        makeRerollEffect("hitRoll", "Hit roll", "ones"),
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Re-roll hit rolls of 1, PLUS full re-roll conditionally ─────────────────
+  function parseRerollHitConditional(name, desc) {
+    if (!/re-roll a Hit roll of 1/i.test(desc)) return null;
+    if (!/re-roll the Hit roll instead/i.test(desc)) return null;
+
+    // This is the "reroll 1s baseline, full reroll conditionally" pattern
+    // e.g. Dat's Our Loot!, Stand Vigil (hit version)
+    const rangedOnly = /ranged attack/i.test(desc);
+    const conditions = [];
+    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+
+    // Base ability: reroll 1s (always on)
+    const base = makeUnitAbility(
+      `${name}: Re-roll hit 1s`,
+      `${name}: Re-roll hit rolls of 1${rangedOnly ? ' (ranged)' : ''}`,
+      conditions,
+      makeRerollEffect("hitRoll", "Hit roll", "ones"),
+      ["unit"]
+    );
+
+    // Upgraded ability: full re-roll (conditional — user toggles in UC)
+    const upgraded = makeUnitAbility(
+      `${name}: Re-roll all hits (conditional)`,
+      `${name}: Re-roll hit rolls (if condition met)`,
+      conditions,
+      makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
+      ["unit"]
+    );
+    // Return both; upgraded starts deactivated
+    upgraded.aliasActive = false;
+    return [base, upgraded];
+  },
+
+  // ── Re-roll wound rolls of 1 ───────────────────────────────────────────────
+  function parseRerollWound1(name, desc) {
+    if (/re-roll a Wound roll of 1/i.test(desc) && !/re-roll the Wound roll instead/i.test(desc)) {
+      const rangedOnly = /ranged attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc);
+      const conditions = [];
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+
+      return makeUnitAbility(
+        `${name}: Re-roll wound 1s`,
+        `${name}: Re-roll wound rolls of 1${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
+        conditions,
+        makeRerollEffect("woundRoll", "Wound roll", "ones"),
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Re-roll wound rolls of 1, PLUS full re-roll conditionally ──────────────
+  function parseRerollWoundConditional(name, desc) {
+    if (!/re-roll a Wound roll of 1/i.test(desc)) return null;
+    if (!/re-roll the Wound roll instead/i.test(desc)) return null;
+
+    const rangedOnly = /ranged attack/i.test(desc);
+    const conditions = [];
+    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+
+    const base = makeUnitAbility(
+      `${name}: Re-roll wound 1s`,
+      `${name}: Re-roll wound rolls of 1`,
+      conditions,
+      makeRerollEffect("woundRoll", "Wound roll", "ones"),
+      ["unit"]
+    );
+    const upgraded = makeUnitAbility(
+      `${name}: Re-roll all wounds (conditional)`,
+      `${name}: Re-roll wound rolls (if condition met)`,
+      conditions,
+      makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
+      ["unit"]
+    );
+    upgraded.aliasActive = false;
+    return [base, upgraded];
+  },
+
+  // ── +1 / -1 to hit roll ────────────────────────────────────────────────────
+  function parseHitMod(name, desc) {
+    const results = [];
+    // "add 1 to the Hit roll"
+    if (/add 1 to the Hit roll/i.test(desc)) {
+      const conditions = [];
+      // Check for MONSTER/VEHICLE condition
+      const targetMatch = desc.match(/targets?\s+(?:a\s+)?(MONSTER|VEHICLE|MONSTER or VEHICLE|VEHICLE or MONSTER)\s+unit/i);
+      if (targetMatch) {
+        const kws = targetMatch[1].toUpperCase().split(/\s+or\s+/i);
+        for (const kw of kws) {
+          conditions.push({ text: "Keyword", type: "keyword", data: { keyword: kw.trim() }, description: `Target has ${kw.trim()} keyword.`, preselected: false });
+        }
+      }
+      const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+
+      results.push(makeUnitAbility(
+        `${name}: +1 to hit`,
+        `${name}: +1 to hit roll`,
+        conditions,
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+        ["unit"]
+      ));
+    }
+    // "subtract 1 from the Hit roll" (defensive, for damaged brackets — handled above, but catch generic)
+    // Intentionally NOT parsed here — Damaged parser handles the specific case
+    return results.length ? results : null;
+  },
+
+  // ── +1 / -1 to wound roll ──────────────────────────────────────────────────
+  function parseWoundMod(name, desc) {
+    const results = [];
+    if (/add 1 to the Wound roll/i.test(desc)) {
+      const conditions = [];
+      const targetMatch = desc.match(/targets?\s+(?:a\s+)?(MONSTER|VEHICLE|MONSTER or VEHICLE|VEHICLE or MONSTER)\s+unit/i);
+      if (targetMatch) {
+        const kws = targetMatch[1].toUpperCase().split(/\s+or\s+/i);
+        for (const kw of kws) {
+          conditions.push({ text: "Keyword", type: "keyword", data: { keyword: kw.trim() }, description: `Target has ${kw.trim()} keyword.`, preselected: false });
+        }
+      }
+      const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+
+      results.push(makeUnitAbility(
+        `${name}: +1 to wound`,
+        `${name}: +1 to wound roll`,
+        conditions,
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+        ["unit"]
+      ));
+    }
+    // Defensive: subtract 1 from wound roll (when targeted)
+    if (/subtract 1 from the Wound roll/i.test(desc) && /attack targets/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: -1 to wound (defending)`,
+        `${name}: -1 to wound roll (attacks targeting this unit)`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      ));
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Subtract 1 from Damage (e.g. Necrodermis) ─────────────────────────────
+  function parseDamageReduction(name, desc) {
+    if (/subtract 1 from (?:the |that attack's )Damage characteristic/i.test(desc)) {
+      return makeUnitAbility(
+        `${name}: -1 Damage`,
+        `${name}: Subtract 1 from Damage characteristic of attacks allocated to this model`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── +1 to Strength (aura/buff on ranged/melee attacks) ─────────────────────
+  function parseStrengthMod(name, desc) {
+    const results = [];
+    const m1 = desc.match(/add (\d+) to the Strength characteristic/i);
+    if (m1 && !/add \d+ to the Attacks and Strength/i.test(desc) && !/improve the Strength and Armour Penetration/i.test(desc)) {
+      const val = parseInt(m1[1], 10);
+      const rangedOnly = /ranged attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc);
+      const conditions = [];
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      results.push(makeUnitAbility(
+        `${name}: +${val} Strength`,
+        `${name}: +${val} to Strength${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
+        conditions,
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
+        ["unit"]
+      ));
+    }
+    // "improve the Strength [and X [and Y]] characteristics ... by N"
+    // e.g. "improve the Strength and Damage characteristics of that attack by 1"
+    // Excludes patterns already caught by parseAttacksStrengthMod (Strength and Armour Penetration)
+    if (results.length === 0 && /improve.*?Strength.*?characteristic/i.test(desc) && !/improve the Strength and Armour Penetration/i.test(desc)) {
+      const mVal = desc.match(/by (\d+)/);
+      const val = mVal ? parseInt(mVal[1], 10) : 1;
+      const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+      const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+      const conditions = [];
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      const ability = makeUnitAbility(
+        `${name}: +${val} Strength`,
+        `${name}: +${val} to Strength${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+        conditions,
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
+        ["unit"]
+      );
+      ability.aliasActive = false;
+      results.push(ability);
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Bracket keywords in ability descriptions ───────────────────────────────
+  // e.g. "ranged weapons equipped by models in this unit have the [IGNORES COVER] ability"
+  // e.g. "this model's hellforged weapons have that ability: [LETHAL HITS] [PRECISION] [SUSTAINED HITS 1]"
+  function parseBracketKeywordsInText(name, desc) {
+    const brackets = extractBracketKeywords(desc);
+    if (brackets.length === 0) return null;
+    // Filter to only combat-relevant keywords we can map
+    const abilities = [];
+    for (const kw of brackets) {
+      const ability = bracketKeywordToAbility(kw, name);
+      if (ability) abilities.push(ability);
+    }
+    return abilities.length ? abilities : null;
+  },
+
+  // ── Re-roll all hit rolls ──────────────────────────────────────────────────
+  function parseFullRerollHit(name, desc) {
+    // "you can re-roll the Hit roll" without "of 1" qualifier
+    if (/re-roll (?:the )?(?:all )?Hit rolls?(?!\s+of\s+1)/i.test(desc) && !/re-roll a Hit roll of 1/i.test(desc)) {
+      const conditions = [];
+      const rangedOnly = /ranged attack/i.test(desc);
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      return makeUnitAbility(
+        `${name}: Re-roll hits`,
+        `${name}: Re-roll hit rolls`,
+        conditions,
+        makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Re-roll all wound rolls ────────────────────────────────────────────────
+  function parseFullRerollWound(name, desc) {
+    if (/re-roll (?:the )?(?:all )?Wound rolls?(?!\s+of\s+1)/i.test(desc) && !/re-roll a Wound roll of 1/i.test(desc)) {
+      return makeUnitAbility(
+        `${name}: Re-roll wounds`,
+        `${name}: Re-roll wound rolls`,
+        [],
+        makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Benefit of Cover ───────────────────────────────────────────────────────
+  function parseBenefitOfCover(name, desc) {
+    if (/(?:has|have) the Benefit of Cover/i.test(desc) && !/cannot have the Benefit of Cover/i.test(desc)) {
+      return makeUnitAbility(
+        `${name}: Benefit of Cover`,
+        `${name}: Has the Benefit of Cover`,
+        [],
+        { text: "Special", type: "special", data: { option: { title: "Has cover", key: "hasCover" } } },
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Halve Damage characteristic (e.g. Avatar of Khaine Molten Form) ────────
+  function parseHalveDamage(name, desc) {
+    if (/halve the Damage characteristic/i.test(desc)) {
+      return makeUnitAbility(
+        `${name}: Half damage`,
+        `${name}: Halve the Damage characteristic of attacks allocated to this model`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Divide by", key: "divide" }, relativeValue: "2" } },
+        ["unit"]
+      );
+    }
+    return null;
+  },
+
+  // ── Critical hit threshold modifier (e.g. "Hit roll of 5+ scores a Critical Hit") ─
+  function parseCritThreshold(name, desc) {
+    const results = [];
+    // "unmodified Hit roll of 5+ scores a Critical Hit" or "Hit roll of 5+ scores a Critical Hit"
+    const m = desc.match(/(?:unmodified\s+)?Hit roll of (\d)\+\s*scores a Critical Hit/i);
+    if (m) {
+      const threshold = parseInt(m[1], 10);
+      const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+      const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+      const conditions = [];
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      results.push(makeUnitAbility(
+        `${name}: Critical hits on ${threshold}+`,
+        `${name}: Unmodified Hit roll of ${threshold}+ scores a Critical Hit`,
+        conditions,
+        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical hit threshold", key: "critHitThreshold" }, absoluteValue: threshold } },
+        ["unit"]
+      ));
+    }
+    // "Wound roll of 5+ scores a Critical Wound"
+    const mw = desc.match(/(?:unmodified\s+)?Wound roll of (\d)\+\s*scores a Critical Wound/i);
+    if (mw) {
+      const threshold = parseInt(mw[1], 10);
+      results.push(makeUnitAbility(
+        `${name}: Critical wounds on ${threshold}+`,
+        `${name}: Unmodified Wound roll of ${threshold}+ scores a Critical Wound`,
+        [],
+        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWoundThreshold" }, absoluteValue: threshold } },
+        ["unit"]
+      ));
+    }
+    return results.length ? results : null;
+  },
+
+  // ── "a successful Hit roll scores a Critical Hit" (e.g. Flayed Ones Flesh Hunger) ─
+  function parseAutoAllCrit(name, desc) {
+    // Pattern: "a successful Hit roll scores a Critical Hit" — every hit becomes a crit
+    // This is different from parseCritThreshold which looks for "Hit roll of N+"
+    if (/a successful Hit roll scores a Critical Hit/i.test(desc)) {
+      const meleeOnly = /melee attack/i.test(desc);
+      const rangedOnly = /ranged attack/i.test(desc) && !meleeOnly;
+      const conditions = [];
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      // In 40K, 1s always fail, so "every successful hit = crit" means threshold 2+
+      const ability = makeUnitAbility(
+        `${name}: All successful hits are Critical`,
+        `${name}: A successful Hit roll scores a Critical Hit (conditional)`,
+        conditions,
+        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical hit threshold", key: "critHitThreshold" }, absoluteValue: 2 } },
+        ["unit"]
+      );
+      // These are always conditional (below half-strength, charged, etc.) — start inactive
+      ability.aliasActive = false;
+      return ability;
+    }
+    return null;
+  },
+
+  // ── Re-roll one Hit/Wound roll (e.g. Crystal Matrix) ──────────────────────
+  function parseRerollOne(name, desc) {
+    const results = [];
+    // "re-roll one Hit roll" — functionally same as re-roll a hit roll (single model)
+    if (/re-roll one Hit roll/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: Re-roll one hit`,
+        `${name}: Re-roll one Hit roll`,
+        [],
+        makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
+        ["unit"]
+      ));
+    }
+    if (/re-roll one Wound roll/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: Re-roll one wound`,
+        `${name}: Re-roll one Wound roll`,
+        [],
+        makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
+        ["unit"]
+      ));
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Re-roll Damage rolls (e.g. Structural Collapse) ───────────────────────
+  function parseRerollDamage(name, desc) {
+    const results = [];
+    // "re-roll a Damage roll of 1" + optional conditional "re-roll the Damage roll instead"
+    if (/re-roll (?:a )?Damage roll of 1/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: Re-roll damage 1s`,
+        `${name}: Re-roll Damage rolls of 1`,
+        [],
+        makeRerollEffect("damage", "Damage", "ones"),
+        ["unit"]
+      ));
+      if (/re-roll the Damage roll instead/i.test(desc)) {
+        const upgraded = makeUnitAbility(
+          `${name}: Re-roll all damage (conditional)`,
+          `${name}: Re-roll the Damage roll (conditional upgrade)`,
+          [],
+          makeRerollEffect("damage", "Damage", "allFailed"),
+          ["unit"]
+        );
+        upgraded.aliasActive = false;
+        results.push(upgraded);
+      }
+    }
+    // "re-roll the Damage roll" (without "of 1") — full reroll
+    else if (/re-roll the Damage roll/i.test(desc) || /re-roll the damage roll/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: Re-roll damage`,
+        `${name}: Re-roll the Damage roll`,
+        [],
+        makeRerollEffect("damage", "Damage", "allFailed"),
+        ["unit"]
+      ));
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Improve BS/WS characteristics (e.g. Wraithlord Psychic Guidance) ──────
+  function parseImproveSkill(name, desc) {
+    const results = [];
+    // "improve the Ballistic Skill and Weapon Skill characteristics...by 1"
+    if (/improve the Ballistic Skill/i.test(desc)) {
+      results.push(makeUnitAbility(
+        `${name}: +1 BS`,
+        `${name}: Improve Ballistic Skill characteristic by 1`,
+        [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false }],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+        ["unit"]
+      ));
+    }
+    if (/improve the Weapon Skill/i.test(desc) || (/improve the Ballistic Skill and Weapon Skill/i.test(desc))) {
+      // If it's "Ballistic Skill and Weapon Skill" both are covered, add melee too
+      if (/Weapon Skill/i.test(desc)) {
+        results.push(makeUnitAbility(
+          `${name}: +1 WS`,
+          `${name}: Improve Weapon Skill characteristic by 1`,
+          [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false }],
+          { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+          ["unit"]
+        ));
+      }
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Defensive -1 to hit (when attacks target this unit) ─────────────────────
+  // e.g. "Each time a melee attack targets this unit, subtract 1 from the Hit roll" (Deft Parry)
+  // Different from Stealth (which only handles ranged) and Damaged (which is self-debuff)
+  function parseDefensiveHitMod(name, desc) {
+    // Must be targeting "this unit/model" and subtracting from hit roll
+    if (!/attack[s]?\s+targets?\s+this/i.test(desc)) return null;
+    if (!/subtract 1 from the Hit roll/i.test(desc)) return null;
+    if (/Damaged/i.test(name)) return null; // Handled by parseDamaged
+
+    const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+    const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+    const conditions = [];
+    if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+
+    // Check for conditional (e.g. Strength > Toughness) — if present, description notes it but we can't model it directly
+    return makeUnitAbility(
+      `${name}: -1 to hit (defending${meleeOnly ? ', melee' : ''}${rangedOnly ? ', ranged' : ''})`,
+      `${name}: -1 to Hit roll (attacks targeting this unit${meleeOnly ? ', melee only' : ''}${rangedOnly ? ', ranged only' : ''})`,
+      conditions,
+      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+      ["unit"]
+    );
+  },
+
+  // ── Offensive debuff: -1 hit for enemy (e.g. Vypers Harassment Fire, auras) ──
+  function parseHitDebuff(name, desc) {
+    // "each time a model in that unit makes an attack, subtract 1 from the Hit roll"
+    // This is an offensive debuff applied to enemies — different from self-Damaged bracket
+    // We detect it by the ABSENCE of "this model makes an attack" and PRESENCE of "that unit/enemy"
+    if (/subtract 1 from the Hit roll/i.test(desc) && !/Damaged/i.test(name)) {
+      // Skip self-targeting patterns (already handled by parseDamaged, parseHitMod)
+      if (/attack targets this/i.test(desc) || /this model makes an attack.*subtract 1 from the Hit roll/i.test(desc)) return null;
+      // This is likely an aura/debuff — mark inactive
+      const ability = makeUnitAbility(
+        `${name}: -1 to hit (debuff)`,
+        `${name}: Subtract 1 from Hit roll (enemy debuff, toggle on target profile)`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      );
+      ability.aliasActive = false;
+      return ability;
+    }
+    return null;
+  },
+
+  // ── Offensive debuff: -1 wound for enemy (e.g. Misfortune) ─────────────────
+  function parseWoundDebuff(name, desc) {
+    // "each time a model in that unit makes an attack, subtract 1 from the Wound roll"
+    // Different from defensive -1 wound (which has "attack targets this unit")
+    if (/subtract 1 from the Wound roll/i.test(desc) && !/attack targets/i.test(desc)) {
+      const ability = makeUnitAbility(
+        `${name}: -1 to wound (debuff)`,
+        `${name}: Subtract 1 from Wound roll (enemy debuff, toggle on target profile)`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      );
+      ability.aliasActive = false;
+      return ability;
+    }
+    return null;
+  },
+
+  // ── Improve Armour Penetration characteristic ──────────────────────────────
+  // e.g. "improve the Armour Penetration characteristic of that attack by 1"
+  // e.g. "worsen the Armour Penetration characteristic of that attack by 1" (defensive)
+  function parseAPMod(name, desc) {
+    const results = [];
+    // Offensive: improve AP by 1 (for this unit's attacks)
+    if (/improve.*?Armour Penetration/i.test(desc)) {
+      const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+      const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+      const conditions = [];
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      const ability = makeUnitAbility(
+        `${name}: +1 AP`,
+        `${name}: Improve AP by 1${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+        conditions,
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "AP", key: "ap" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+        ["unit"]
+      );
+      // Aura/conditional abilities start inactive
+      if (/(?:friendly|other|within \d+"|Aura)/i.test(desc) || /Pain/i.test(name)) ability.aliasActive = false;
+      results.push(ability);
+    }
+    // Defensive: worsen AP by 1 (attacks targeting this/that unit)
+    if (/worsen.*?Armour Penetration/i.test(desc) && /attack[s]?\s+targets?\s+(?:this|that)/i.test(desc)) {
+      const defAbility = makeUnitAbility(
+        `${name}: -1 AP (defending)`,
+        `${name}: Worsen AP by 1 (attacks targeting this unit)`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "AP", key: "ap" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
+        ["unit"]
+      );
+      // Aura targeting "that unit" (not "this unit") → inactive
+      if (/targets?\s+that\s+unit/i.test(desc) || /(?:friendly|other|within \d+"|Aura)/i.test(desc)) defAbility.aliasActive = false;
+      results.push(defAbility);
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Add to Attacks / Strength characteristics ─────────────────────────────
+  // e.g. "add 1 to the Attacks and Strength characteristics of this unit's melee weapons"
+  // e.g. "improve the Strength and Armour Penetration characteristics of that attack by 1"
+  function parseAttacksStrengthMod(name, desc) {
+    const results = [];
+    // "add N to the Attacks characteristic" or combined "Attacks and Strength"
+    const mAtt = desc.match(/add (\d+) to the Attacks (?:and Strength )?characteristic/i);
+    if (mAtt) {
+      const val = parseInt(mAtt[1], 10);
+      const meleeOnly = /melee/i.test(desc);
+      const conditions = [];
+      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      const ability = makeUnitAbility(
+        `${name}: +${val} Attacks`,
+        `${name}: +${val} to Attacks characteristic${meleeOnly ? ' (melee)' : ''}`,
+        conditions,
+        { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: String(val), applyToExtraAttacks: false } },
+        ["unit"]
+      );
+      // These are almost always conditional (Pain, once-per-battle, enhancement) — start inactive
+      ability.aliasActive = false;
+      results.push(ability);
+    }
+    // Combined "Attacks and Strength" or just "Strength" from the same text (if not already caught by parseStrengthMod)
+    // Only match "add N to the ... Strength characteristic" when paired with Attacks (to avoid overlap with parseStrengthMod)
+    if (/add \d+ to the Attacks and Strength characteristic/i.test(desc)) {
+      const mVal = desc.match(/add (\d+) to the Attacks and Strength/i);
+      if (mVal) {
+        const val = parseInt(mVal[1], 10);
+        const meleeOnly = /melee/i.test(desc);
+        const conditions = [];
+        if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+        const ability = makeUnitAbility(
+          `${name}: +${val} Strength`,
+          `${name}: +${val} to Strength characteristic${meleeOnly ? ' (melee)' : ''}`,
+          conditions,
+          { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
+          ["unit"]
+        );
+        ability.aliasActive = false;
+        results.push(ability);
+      }
+    }
+    // "improve the Strength and Armour Penetration characteristics ... by 1" (Lelith pattern)
+    // Strength half — only if not a standalone Strength mod (avoid overlap with parseStrengthMod)
+    if (/improve the Strength and Armour Penetration/i.test(desc)) {
+      const ability = makeUnitAbility(
+        `${name}: +1 Strength`,
+        `${name}: +1 to Strength characteristic (conditional)`,
+        [],
+        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
+        ["unit"]
+      );
+      ability.aliasActive = false;
+      results.push(ability);
+    }
+    return results.length ? results : null;
+  },
+
+  // ── Improve Damage characteristic ──────────────────────────────────────────
+  // e.g. "improve the Strength and Damage characteristics of that attack by 1"
+  // e.g. "improve the Strength, Armour Penetration and Damage characteristics ... by 1"
+  function parseDamageImprovement(name, desc) {
+    // Must mention improving Damage characteristic
+    if (!/improve.*?Damage characteristic/i.test(desc)) return null;
+    // Don't match "subtract 1 from ... Damage" — that's damage reduction (parseDamageReduction)
+    if (/subtract.*?Damage/i.test(desc)) return null;
+    const mVal = desc.match(/by (\d+)/);
+    const val = mVal ? parseInt(mVal[1], 10) : 1;
+    const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
+    const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
+    const conditions = [];
+    if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+    const ability = makeUnitAbility(
+      `${name}: +${val} Damage`,
+      `${name}: +${val} to Damage characteristic${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+      conditions,
+      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
+      ["unit"]
+    );
+    // Almost always conditional (charge, aura, etc.) — start inactive
+    ability.aliasActive = false;
+    return ability;
+  },
+
+  // ── Invulnerable save from text (non-profile-name pattern) ─────────────────
+  // e.g. "models in this unit have a 5+ invulnerable save"
+  function parseInvulnFromText(name, desc) {
+    const m = desc.match(/(\d+)\+\s*invulnerable save/i);
+    if (m && !/^Invulnerable Save/i.test(name)) {
+      // Return as metadata, not an ability — handled separately
+      return { _invuln: parseInt(m[1], 10) };
+    }
+    return null;
+  },
+];
+
+// Run all parsers on a name+description pair, return array of ability objects
+function runAbilityParsers(name, description) {
+  // Normalize non-breaking spaces (\u00A0) that appear throughout BSData/ListForge JSON
+  // Also normalize smart quotes (curly apostrophes \u2018/\u2019) to ASCII
+  name = (name || "").replace(/\u00A0/g, ' ').replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"');
+  description = (description || "").replace(/\u00A0/g, ' ').replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/\*\*/g, '').replace(/\^\^/g, '');
+  const results = [];
+  for (const parser of ABILITY_PARSERS) {
+    const result = parser(name, description);
+    if (result === null) continue;
+    if (result._invuln !== undefined) {
+      results.push(result); // pass through invuln metadata
+      continue;
+    }
+    if (Array.isArray(result)) {
+      results.push(...result);
+    } else {
+      results.push(result);
+    }
+  }
+  return results;
+}
+
+// Identify offensive stat-mod abilities that BSData bakes into weapon profiles
+// when they originate from enhancements. These should be suppressed to avoid
+// double-counting (BSData already modified the weapon's S/AP/D/A/BS/WS).
+function isOffensiveStatMod(ability) {
+  if (!ability || !ability.effect) return false;
+  const eff = ability.effect;
+  // Relative weapon stat mods: Strength, AP, Damage
+  if (eff.type === "modifyRelative" && eff.data && eff.data.application) {
+    const key = eff.data.application.key;
+    if (["strength", "ap", "damage"].includes(key)) return true;
+    // BS/WS improvements are hitRoll +1 but only offensive ones (not defensive -1 to hit)
+    if (key === "hitRoll" && eff.data.operator && eff.data.operator.key === "add") return true;
+  }
+  // Attacks characteristic increase
+  if (eff.type === "increaseWeaponAttacks") return true;
+  return false;
+}
+
+// Collect all abilities from a selection's profiles, rules, and child upgrades
+function extractParsedAbilities(selection) {
+  const abilities = [];
+  const seenNames = new Set();
+  let textInvuln = null;
+
+  function addUnique(abilityOrMeta) {
+    if (abilityOrMeta._invuln !== undefined) {
+      if (textInvuln === null || abilityOrMeta._invuln < textInvuln) {
+        textInvuln = abilityOrMeta._invuln;
+      }
+      return;
+    }
+    const key = abilityOrMeta.aliases[0].name;
+    if (seenNames.has(key)) return;
+    seenNames.add(key);
+    abilities.push(abilityOrMeta);
+  }
+
+  // 1. Datasheet abilities: selection.profiles[] where typeName === "Abilities"
+  for (const p of (selection.profiles || [])) {
+    if (p.typeName !== "Abilities") continue;
+    const abilityName = p.name || "";
+    if (/^Invulnerable Save/i.test(abilityName)) continue; // handled separately
+    if (/^Leader$/i.test(abilityName)) continue; // not combat-relevant
+    let desc = "";
+    for (const c of (p.characteristics || [])) {
+      desc = c.$text || "";
+    }
+    for (const a of runAbilityParsers(abilityName, desc)) addUnique(a);
+  }
+
+  // 2. Rules: selection.rules[] (FNP, Stealth, etc.)
+  for (const r of (selection.rules || [])) {
+    const rName = r.name || "";
+    const rDesc = r.description || "";
+    for (const a of runAbilityParsers(rName, rDesc)) addUnique(a);
+  }
+
+  // 3. Enhancement/upgrade child selections
+  for (const child of (selection.selections || [])) {
+    if (child.type !== "upgrade") continue;
+    // Enhancement abilities
+    for (const p of (child.profiles || [])) {
+      if (p.typeName !== "Abilities") continue;
+      const aName = p.name || "";
+      if (/^Invulnerable Save/i.test(aName)) continue;
+      let desc = "";
+      for (const c of (p.characteristics || [])) {
+        desc = c.$text || "";
+      }
+      for (const a of runAbilityParsers(aName, desc)) {
+        // Enhancement stat mods: BSData bakes S/AP/D/A/BS/WS changes into profiles
+        if (isOffensiveStatMod(a)) {
+          a.aliasActive = false;
+          a.description = `⚠️ ENHANCEMENT STAT MOD (likely baked into profile by BSData) — ${a.description}`;
+        }
+        addUnique(a);
+      }
+    }
+    // Enhancement rules
+    for (const r of (child.rules || [])) {
+      const rName = r.name || "";
+      const rDesc = r.description || "";
+      // Skip generic keyword explanation rules (they explain what Blast/Heavy etc. mean)
+      if (KEYWORD_ABILITY_MAP[rName.toLowerCase()]) continue;
+      // Also skip bare keyword names (e.g. "Sustained Hits", "Rapid Fire", "Anti-", "Melta")
+      // BSData includes the full rulebook text for these as child rules on weapons
+      const bareKW = rName.toLowerCase().replace(/[-\s]+$/, '');
+      if (/^(sustained hits|rapid fire|anti|melta|torrent|twin-linked|lance|psychic|ignores cover|precision|blast|hazardous|indirect fire|assault|heavy|devastating wounds|lethal hits|pistol|extra attacks|one shot|feel no pain|fights first)$/i.test(bareKW)) continue;
+      for (const a of runAbilityParsers(rName, rDesc)) {
+        // Enhancement stat mods: BSData bakes S/AP/D/A/BS/WS changes into profiles
+        if (isOffensiveStatMod(a)) {
+          a.aliasActive = false;
+          a.description = `⚠️ ENHANCEMENT STAT MOD (likely baked into profile by BSData) — ${a.description}`;
+        }
+        addUnique(a);
+      }
+    }
+  }
+
+  // 4. Model children and their equipment upgrades
+  // Equipment like Serpent Shield, Dispersion Shield etc. live at model → upgrade → Abilities.
+  // Scan these for combat-relevant abilities (FNP, stat mods, etc.)
+  // NOTE: Skip _invuln metadata — bearer-only invulns (Mistshield, Dispersion Shield) are
+  // handled per-model by extractInvulnFromTree in processSelectionUnit.
+  for (const child of (selection.selections || [])) {
+    if (child.type !== "model") continue;
+    // Model's own ability profiles
+    for (const p of (child.profiles || [])) {
+      if (p.typeName !== "Abilities") continue;
+      const aName = p.name || "";
+      if (/^Invulnerable Save/i.test(aName)) continue;
+      if (/^Leader$/i.test(aName)) continue;
+      let desc = "";
+      for (const c of (p.characteristics || [])) { desc = c.$text || ""; }
+      for (const a of runAbilityParsers(aName, desc)) {
+        if (a._invuln !== undefined) continue; // per-model invuln, skip
+        addUnique(a);
+      }
+    }
+    // Model's equipment upgrade profiles
+    for (const equip of (child.selections || [])) {
+      if (equip.type !== "upgrade") continue;
+      for (const p of (equip.profiles || [])) {
+        if (p.typeName !== "Abilities") continue;
+        const aName = p.name || "";
+        if (/^Invulnerable Save/i.test(aName)) continue;
+        let desc = "";
+        for (const c of (p.characteristics || [])) { desc = c.$text || ""; }
+        for (const a of runAbilityParsers(aName, desc)) {
+          if (a._invuln !== undefined) continue; // per-model invuln, skip
+          addUnique(a);
+        }
+      }
+    }
+  }
+
+  return { abilities, textInvuln };
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function genUUID() {
+  return crypto.randomUUID();
+}
+
+function parseStatValue(text) {
+  if (text == null) return null;
+  text = String(text).trim().replace(/\u201d/g, '').replace(/"/g, '');
+  const mPlus = text.match(/^(\d+)\+$/);
+  if (mPlus) return parseInt(mPlus[1], 10);
+  const n = parseInt(text, 10);
+  if (!isNaN(n) && String(n) === text) return n;
+  // negative ints like "-2"
+  if (/^-\d+$/.test(text)) return parseInt(text, 10);
+  return text; // "D6", "D3+1", etc.
+}
+
+function parseDamageValue(text) {
+  if (text == null) return 1;
+  text = String(text).trim().replace(/\u201d/g, '').replace(/"/g, '');
+  const mPlus = text.match(/^(\d+)\+$/);
+  if (mPlus) return parseInt(mPlus[1], 10);
+  const n = parseInt(text, 10);
+  if (!isNaN(n) && String(n) === text) return n;
+  return text;
+}
+
+function extractInvulnSave(profiles) {
+  for (const p of profiles) {
+    if (p.typeName === "Abilities") {
+      const name = p.name || "";
+      let m = name.match(/Invulnerable Save (\d+)\+/);
+      if (m) return parseInt(m[1], 10);
+      for (const c of (p.characteristics || [])) {
+        const txt = c.$text || "";
+        m = txt.match(/Invulnerable Save (\d+)\+/i);
+        if (m) return parseInt(m[1], 10);
+        m = txt.match(/invulnerable save.*?(\d+)\+/i);
+        if (m) return parseInt(m[1], 10);
+      }
+    }
+  }
+  return null;
+}
+
+// Recursively search a selection and all its child selections for invulnerable save profiles.
+// Equipment like Dispersion Shield lives at: model → upgrade → Abilities profile.
+function extractInvulnFromTree(selection) {
+  let inv = extractInvulnSave(selection.profiles || []);
+  if (inv != null) return inv;
+
+  // Also check ability text for "bearer has a X+ invulnerable save"
+  for (const p of (selection.profiles || [])) {
+    if (p.typeName !== "Abilities") continue;
+    for (const c of (p.characteristics || [])) {
+      let txt = (c.$text || "").replace(/\u00A0/g, ' ').replace(/[\u2018\u2019]/g, "'");
+      const m = txt.match(/(?:bearer|model)s?\s+(?:has|have)\s+a\s+(\d+)\+\s*invulnerable save/i);
+      if (m) return parseInt(m[1], 10);
+      const m2 = txt.match(/models? in (?:the bearer's|this|that) unit have a (\d+)\+\s*invulnerable save/i);
+      if (m2) return parseInt(m2[1], 10);
+    }
+  }
+
+  for (const child of (selection.selections || [])) {
+    inv = extractInvulnFromTree(child);
+    if (inv != null) return inv;
+  }
+  return null;
+}
+
+// Search selection tree for unit-WIDE invuln text only (not bearer-only).
+// Matches: "Models in the bearer's unit have a 5+ invulnerable save" (Serpent Shield)
+// Skips:   "The bearer has a 4+ invulnerable save" (Mistshield — handled per-model)
+function extractUnitWideInvulnFromTree(selection) {
+  for (const p of (selection.profiles || [])) {
+    if (p.typeName !== "Abilities") continue;
+    for (const c of (p.characteristics || [])) {
+      let txt = (c.$text || "").replace(/\u00A0/g, ' ').replace(/[\u2018\u2019]/g, "'");
+      const m = txt.match(/models? in (?:the bearer's|this|that) unit have a (\d+)\+\s*invulnerable save/i);
+      if (m) return parseInt(m[1], 10);
+    }
+  }
+  for (const child of (selection.selections || [])) {
+    const inv = extractUnitWideInvulnFromTree(child);
+    if (inv != null) return inv;
+  }
+  return null;
+}
+
+function extractUnitProfile(profiles) {
+  for (const p of profiles) {
+    if (p.typeName === "Unit") {
+      const stats = {};
+      for (const c of (p.characteristics || [])) {
+        const val = c.$text || "";
+        switch (c.name) {
+          case "M":  stats.movement   = parseStatValue(val); break;
+          case "T":  stats.toughness  = parseStatValue(val); break;
+          case "SV": stats.save       = parseStatValue(val); break;
+          case "W":  stats.wounds     = parseStatValue(val); break;
+          case "LD": stats.leadership = parseStatValue(val); break;
+          case "OC": stats.oc         = parseStatValue(val); break;
+        }
+      }
+      return stats;
+    }
+  }
+  return null;
+}
+
+function parseWeaponKeywords(keywordsText) {
+  if (!keywordsText) return [];
+  const abilities = [];
+  const rawKeywords = keywordsText.split(",").map(k => k.trim());
+
+  for (const kw of rawKeywords) {
+    let kwLower = kw.toLowerCase().trim();
+
+    // Normalize BSData keyword inconsistencies
+    kwLower = kwLower
+      .replace(/^twin linked$/, 'twin-linked')       // missing hyphen
+      .replace(/^sustain hits/, 'sustained hits');    // missing "ed"
+
+    // Direct match
+    if (KEYWORD_ABILITY_MAP[kwLower]) {
+      const t = KEYWORD_ABILITY_MAP[kwLower];
+      abilities.push({
+        aliases: t.aliases.map(a => ({ ...a })),
+        aliasActive: true,
+        conditions: t.conditions,
+        description: t.description,
+        effect: t.effect,
+        scope: [...t.scope],
+        id: genUUID(),
+        sharedWithAllUnits: false
+      });
+      continue;
+    }
+
+    // Anti-KEYWORD X+
+    const antiMatch = kwLower.match(/anti[- ](\w+)\s+(\d+)\+/);
+    if (antiMatch) {
+      const target = antiMatch[1].toUpperCase();
+      const threshold = parseInt(antiMatch[2], 10);
+      abilities.push({
+        aliases: [{ name: `Anti-${target} ${threshold}+`, type: "reserved" }],
+        aliasActive: true,
+        conditions: [{ text: "Keyword", type: "keyword", data: { keyword: target }, description: `Target has ${target} keyword.`, preselected: false }],
+        description: `Critical wound on ${threshold}+ (vs ${target})`,
+        effect: { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWound" }, absoluteValue: threshold } },
+        scope: ["weapon"],
+        id: genUUID(),
+        sharedWithAllUnits: false
+      });
+      continue;
+    }
+
+    // Melta X
+    const meltaMatch = kwLower.match(/melta\s+(\d+)/);
+    if (meltaMatch) {
+      const mVal = parseInt(meltaMatch[1], 10);
+      abilities.push({
+        aliases: [{ name: `Melta ${mVal}`, type: "reserved" }],
+        aliasActive: true,
+        conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+        description: `+${mVal} to damage (within half range)`,
+        effect: { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: mVal } },
+        scope: ["weapon"],
+        id: genUUID(),
+        sharedWithAllUnits: false
+      });
+      continue;
+    }
+
+    // Sustained hits (variable)
+    const sustainedMatch = kwLower.match(/sustained hits\s+(\w+)/);
+    if (sustainedMatch) {
+      const key = `sustained hits ${sustainedMatch[1]}`;
+      if (KEYWORD_ABILITY_MAP[key]) {
+        const t = KEYWORD_ABILITY_MAP[key];
+        abilities.push({
+          aliases: t.aliases.map(a => ({ ...a })),
+          aliasActive: true, conditions: t.conditions, description: t.description,
+          effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+        });
+      }
+      continue;
+    }
+
+    // Rapid fire (variable)
+    const rapidMatch = kwLower.match(/rapid fire\s+(\w+)/);
+    if (rapidMatch) {
+      const key = `rapid fire ${rapidMatch[1]}`;
+      if (KEYWORD_ABILITY_MAP[key]) {
+        const t = KEYWORD_ABILITY_MAP[key];
+        abilities.push({
+          aliases: t.aliases.map(a => ({ ...a })),
+          aliasActive: true, conditions: t.conditions, description: t.description,
+          effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+        });
+      }
+      continue;
+    }
+  }
+  return abilities;
+}
+
+function parseWeaponProfile(profile, weaponType) {
+  const chars = {};
+  let keywordsText = "";
+  for (const c of (profile.characteristics || [])) {
+    const val = c.$text || "";
+    switch (c.name) {
+      case "Range":    chars.range    = val; break;
+      case "A":        chars.attacks  = parseDamageValue(val); break;
+      case "BS":       chars.bs       = parseStatValue(val); break;
+      case "WS":       chars.ws       = parseStatValue(val); break;
+      case "S":        chars.strength = parseStatValue(val); break;
+      case "AP":       chars.ap       = parseStatValue(val); break;
+      case "D":        chars.damage   = parseDamageValue(val); break;
+      case "Keywords": keywordsText   = val; break;
+    }
+  }
+
+  const weapon = {
+    name: profile.name || "Unknown",
+    nameUnique: profile.name || "Unknown",
+    countPerUnit: 1,
+    type: weaponType,
+    attacks: chars.attacks ?? 1,
+    bs: weaponType === "Ranged" ? ((typeof chars.bs === 'number') ? chars.bs : 4) : null,
+    ws: weaponType === "Melee" ? ((typeof chars.ws === 'number') ? chars.ws : 4) : null,
+    strength: chars.strength ?? 4,
+    ap: chars.ap ?? 0,
+    damage: chars.damage ?? 1,
+    abilities: parseWeaponKeywords(keywordsText),
+    id: genUUID()
+  };
+
+  return weapon;
+}
+
+function extractWeaponsFromSelection(selection) {
+  const weapons = [];
+  for (const p of (selection.profiles || [])) {
+    if (p.typeName === "Ranged Weapons") weapons.push(parseWeaponProfile(p, "Ranged"));
+    else if (p.typeName === "Melee Weapons") weapons.push(parseWeaponProfile(p, "Melee"));
+  }
+  for (const child of (selection.selections || [])) {
+    weapons.push(...extractWeaponsFromSelection(child));
+  }
+  return weapons;
+}
+
+function getKeywordsFromCategories(categories) {
+  const skipPrefixes = ["Faction:"];
+  const skipNames = new Set(["Configuration", "Show/Hide Options"]);
+  const keywords = [];
+  for (const cat of categories) {
+    const name = cat.name || "";
+    if (skipNames.has(name)) continue;
+    if (skipPrefixes.some(p => name.startsWith(p))) continue;
+    keywords.push(name.toUpperCase());
+  }
+  return keywords;
+}
+
+function processSelectionUnit(selection) {
+  const name = selection.name || "Unknown";
+  let points = 0;
+  for (const cost of (selection.costs || [])) {
+    if (cost.name === "pts") points = parseInt(cost.value, 10) || 0;
+  }
+  // BSData sometimes stores points on child model selections instead of the unit
+  if (points === 0) {
+    function sumChildPts(sel) {
+      let total = 0;
+      for (const cost of (sel.costs || [])) {
+        if (cost.name === "pts") total += parseInt(cost.value, 10) || 0;
+      }
+      for (const child of (sel.selections || [])) {
+        total += sumChildPts(child);
+      }
+      return total;
+    }
+    points = sumChildPts(selection);
+  }
+
+  const rawKeywords = getKeywordsFromCategories(selection.categories || []);
+  let invuln = extractInvulnSave(selection.profiles || []);
+  const unitStats = extractUnitProfile(selection.profiles || []);
+
+  // Extract combat-relevant abilities from text
+  const { abilities: parsedAbilities, textInvuln } = extractParsedAbilities(selection);
+  // Use text-parsed invuln as fallback (e.g. "models in this unit have a 5+ invulnerable save")
+  if (invuln == null && textInvuln != null) invuln = textInvuln;
+  // Also search full selection tree for UNIT-WIDE invulns on model equipment
+  // e.g. Serpent Shield: "Models in the bearer's unit have a 5+ invulnerable save"
+  // Do NOT pick up bearer-only invulns here (those are per-model, handled later)
+  if (invuln == null) {
+    invuln = extractUnitWideInvulnFromTree(selection);
+  }
+
+  const modelTypes = [];
+  const allWeaponsMelee = [];
+  const allWeaponsRanged = [];
+  const now = new Date().toISOString();
+
+  if (selection.type === "model") {
+    if (unitStats) {
+      const weapons = extractWeaponsFromSelection(selection);
+      const modelNum = selection.number || 1;
+      const mtId = genUUID();
+      for (const w of weapons) {
+        w.countPerUnit = modelNum;
+        (w.type === "Melee" ? allWeaponsMelee : allWeaponsRanged).push(w.id);
+      }
+      modelTypes.push({
+        keywords: rawKeywords, weapons,
+        id: mtId, ignore: null, invuln,
+        modelCount: selection.number || 1, name,
+        save: unitStats.save ?? 6, toughness: unitStats.toughness ?? 4, wounds: unitStats.wounds ?? 1,
+        weaponsValid: { dirty: false, invalid: false, message: null }
+      });
+    }
+  } else if (selection.type === "unit") {
+    // Collect model sub-selections, including those nested inside upgrade wrappers
+    // (e.g. Gretchin: unit -> "2 Runtherds and 20 Gretchin" (upgrade) -> Runtherd/Gretchin (model))
+    function collectModelSubs(sels) {
+      const models = [];
+      for (const s of (sels || [])) {
+        if (s.type === "model") {
+          models.push(s);
+        } else if (s.type === "upgrade") {
+          models.push(...collectModelSubs(s.selections));
+        }
+      }
+      return models;
+    }
+    const modelSubs = collectModelSubs(selection.selections);
+    const modelGroups = new Map();
+
+    for (const sub of modelSubs) {
+      let subStats = extractUnitProfile(sub.profiles || []) || unitStats;
+      if (!subStats) continue;
+      let subInvuln = extractInvulnFromTree(sub);
+      if (subInvuln == null) subInvuln = invuln;
+
+      const key = `${subStats.toughness}|${subStats.save}|${subStats.wounds}|${subInvuln}`;
+      const weapons = extractWeaponsFromSelection(sub);
+      const subCount = sub.number || 1;
+      // Tag each weapon with how many models carry it
+      for (const w of weapons) w.countPerUnit = subCount;
+
+      if (modelGroups.has(key)) {
+        const g = modelGroups.get(key);
+        g.count += subCount;
+        g.subNames.add(sub.name || name);
+        // Merge weapons: sum counts for matching names, add new ones
+        for (const w of weapons) {
+          const existing = g.weapons.find(ew => ew.name === w.name && ew.type === w.type);
+          if (existing) {
+            existing.countPerUnit += w.countPerUnit;
+          } else {
+            g.weapons.push(w);
+          }
+        }
+      } else {
+        modelGroups.set(key, {
+          count: subCount, weapons,
+          name: sub.name || name, subNames: new Set([sub.name || name]),
+          stats: subStats, invuln: subInvuln
+        });
+      }
+    }
+
+    for (const [, group] of modelGroups) {
+      const mtId = genUUID();
+      for (const w of group.weapons) {
+        (w.type === "Melee" ? allWeaponsMelee : allWeaponsRanged).push(w.id);
+      }
+      // If multiple model names merged (e.g. Spanner + Loota), use the unit name
+      const groupName = group.subNames.size > 1 ? name : group.name;
+      modelTypes.push({
+        keywords: rawKeywords, weapons: group.weapons,
+        id: mtId, ignore: null, invuln: group.invuln,
+        modelCount: group.count, name: groupName,
+        save: group.stats.save ?? 6, toughness: group.stats.toughness ?? 4, wounds: group.stats.wounds ?? 1,
+        weaponsValid: { dirty: false, invalid: false, message: null }
+      });
+    }
+
+    // Fallback: unit has stats but no model sub-selections
+    if (modelTypes.length === 0 && unitStats) {
+      const weapons = extractWeaponsFromSelection(selection);
+      const modelNum = selection.number || 1;
+      const mtId = genUUID();
+      for (const w of weapons) {
+        w.countPerUnit = modelNum;
+        (w.type === "Melee" ? allWeaponsMelee : allWeaponsRanged).push(w.id);
+      }
+      modelTypes.push({
+        keywords: rawKeywords, weapons,
+        id: mtId, ignore: null, invuln,
+        modelCount: selection.number || 1, name,
+        save: unitStats.save ?? 6, toughness: unitStats.toughness ?? 4, wounds: unitStats.wounds ?? 1,
+        weaponsValid: { dirty: false, invalid: false, message: null }
+      });
+    }
+  }
+
+  if (modelTypes.length === 0) return null;
+
+  const unitId = genUUID();
+  const totalModels = modelTypes.reduce((s, mt) => s + mt.modelCount, 0);
+
+  // Build ability selected IDs (only those with aliasActive: true)
+  const activeAbilityIds = parsedAbilities.filter(a => a.aliasActive !== false).map(a => a.id);
+
+  return {
+    name,
+    computed_keywords: rawKeywords,
+    computed_leaders: [],
+    computed_model_count: totalModels,
+    computed_points: points,
+    computed_roles: ["Attacker: Melee", "Attacker: Ranged", "Defender"],
+    computed_toughness: modelTypes[0].toughness,
+    computed_wounds: modelTypes[0].wounds,
+    order_slain_auto: true,
+    order_slain_model_types: modelTypes.map(mt => ({
+      modelTypeId: mt.id, modelTypeName: null, unitId
+    })),
+    units: [{
+      abilities: parsedAbilities, id: unitId, leader: false, name, points,
+      model_types: modelTypes, abilities_selected: [...activeAbilityIds]
+    }],
+    weapons_selected_melee: [...allWeaponsMelee],
+    weapons_selected_ranged: [...allWeaponsRanged],
+    updated: now,
+    created: now
+  };
+}
+
+// ── Profile Fingerprinting (for dedup) ──────────────────────────────────────
+function fingerprintWeapon(w) {
+  const abilityKeys = (w.abilities || []).map(a =>
+    (a.aliases || []).map(al => al.name).sort().join('+')
+  ).sort().join('|');
+  return `${w.name}::${w.type}::${w.attacks}::${w.strength}::${w.ap}::${w.damage}::${w.bs ?? ''}::${w.ws ?? ''}::${abilityKeys}`;
+}
+
+function fingerprintModelType(mt) {
+  const weps = mt.weapons.map(fingerprintWeapon).sort().join(';;');
+  return `${mt.name}::T${mt.toughness}::SV${mt.save}::W${mt.wounds}::INV${mt.invuln}::N${mt.modelCount}::${weps}`;
+}
+
+function fingerprintProfile(p) {
+  const mts = p.units[0].model_types.map(fingerprintModelType).sort().join('|||');
+  const kws = p.computed_keywords.slice().sort().join(',');
+  return `${p.name}::${p.computed_points}::${kws}::${mts}`;
+}
+
+// ── Main Conversion ─────────────────────────────────────────────────────────
+function convert(jsonData, fileName) {
+  const roster = jsonData.roster || jsonData;
+  const rosterName = roster.name || fileName.replace(/\.json$/i, '');
+
+  const profiles = [];
+  const seenFingerprints = new Set();
+  let dupeCount = 0;
+  const errors = [];
+
+  for (const force of (roster.forces || [])) {
+    for (const selection of (force.selections || [])) {
+      const selType = selection.type || "";
+
+      if (selType === "upgrade") {
+        const catNames = (selection.categories || []).map(c => c.name || "");
+        if (catNames.includes("Configuration")) continue;
+      }
+
+      if (selType === "unit" || selType === "model") {
+        try {
+          const profile = processSelectionUnit(selection);
+          if (profile) {
+            const fp = fingerprintProfile(profile);
+            if (seenFingerprints.has(fp)) {
+              dupeCount++;
+              continue;
+            }
+            seenFingerprints.add(fp);
+            profiles.push(profile);
+          }
+        } catch (unitErr) {
+          errors.push(`${selection.name || 'Unknown'}: ${unitErr.message}`);
+        }
+      }
+    }
+  }
+
+  // Name duplicate profiles by their unique weapon loadouts instead of "(2)", "(3)", etc.
+  const nameGroups = new Map();
+  for (const p of profiles) {
+    if (!nameGroups.has(p.name)) nameGroups.set(p.name, []);
+    nameGroups.get(p.name).push(p);
+  }
+  for (const [baseName, group] of nameGroups) {
+    if (group.length <= 1) continue;
+    // Collect weapon name sets for each profile (exclude generic melee like "Close combat weapon")
+    const genericMelee = new Set(["close combat weapon", "fists", "armoured hull"]);
+    const weaponSets = group.map(p => {
+      const names = new Set();
+      for (const mt of p.units[0].model_types) {
+        for (const w of mt.weapons) {
+          if (!genericMelee.has(w.name.toLowerCase())) names.add(w.name);
+        }
+      }
+      return names;
+    });
+    // Find the intersection (weapons shared by all)
+    const shared = new Set(weaponSets[0]);
+    for (let i = 1; i < weaponSets.length; i++) {
+      for (const w of shared) {
+        if (!weaponSets[i].has(w)) shared.delete(w);
+      }
+    }
+    // Name each profile by its unique weapons (those not in the shared set)
+    const usedNames = new Set();
+    for (let i = 0; i < group.length; i++) {
+      const unique = [...weaponSets[i]].filter(w => !shared.has(w));
+      let suffix = unique.length > 0 ? unique.join(", ") : null;
+      // Fallback: if no unique weapons found (or collision), use numbered suffix
+      let newName = suffix ? `${baseName} - ${suffix}` : baseName;
+      if (usedNames.has(newName) || (!suffix && i > 0)) {
+        let count = i + 1;
+        newName = `${baseName} (${count})`;
+        while (usedNames.has(newName)) { count++; newName = `${baseName} (${count})`; }
+      }
+      usedNames.add(newName);
+      group[i].name = newName;
+      group[i].units[0].name = newName;
+    }
+  }
+
+  return {
+    appVersion: "0.73.17",
+    exported: Date.now(),
+    profiles,
+    _dupeCount: dupeCount,
+    _errors: errors
+  };
+}
+
+// ── UI ──────────────────────────────────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const logEl = document.getElementById('log');
+
+function log(text, cls = 'info') {
+  logEl.style.display = 'block';
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = text;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function handleFile(file) {
+  logEl.innerHTML = '';
+  logEl.style.display = 'none';
+
+  if (!file.name.endsWith('.json')) {
+    log('Error: Please drop a .json file.', 'error');
+    return;
+  }
+
+  log(`Reading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`);
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      log('Parsed JSON successfully.');
+
+      const output = convert(data, file.name);
+      const dupeCount = output._dupeCount;
+      const errors = output._errors;
+      delete output._dupeCount;
+      delete output._errors;
+      const count = output.profiles.length;
+
+      if (count === 0) {
+        log('No unit profiles found in this file.', 'error');
+        return;
+      }
+
+      if (dupeCount > 0) {
+        log(`Skipped ${dupeCount} duplicate profile(s).`, 'info');
+      }
+
+      if (errors.length > 0) {
+        for (const err of errors) {
+          log(`  ⚠️ ${err}`, 'error');
+        }
+      }
+
+      let flaggedCount = 0;
+      for (const p of output.profiles) {
+        const mt = p.units[0].model_types;
+        const wCount = mt.reduce((s, m) => s + m.weapons.length, 0);
+        const aCount = p.units[0].abilities.length;
+        const flagged = p.units[0].abilities.filter(a => a.description && a.description.includes('⚠️ ENHANCEMENT STAT MOD')).length;
+        flaggedCount += flagged;
+        const aPart = aCount > 0 ? `, ${aCount} ability(ies)` : '';
+        const fPart = flagged > 0 ? ` ⚠️ ${flagged} stat mod(s) suppressed` : '';
+        log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}]`, 'unit');
+      }
+
+      if (flaggedCount > 0) {
+        log(`${flaggedCount} enhancement stat mod(s) set inactive (already baked into weapon profiles by BSData).`, 'info');
+      }
+
+      log(`Converted ${count} profile(s). Packing msgpack...`);
+
+      const packed = msgpack.encode(output);
+      log(`Packed ${packed.length} bytes.`, 'success');
+
+      // Auto-download
+      const rosterName = (data.roster || data).name || file.name.replace(/\.json$/i, '');
+      const outName = `${rosterName}_unitcrunch.txt`;
+      const blob = new Blob([packed], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = outName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      log(`Downloaded: ${outName}`, 'success');
+    } catch (err) {
+      log(`Error: ${err.message}`, 'error');
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+dropZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); fileInput.value = ''; });
+</script>
+</body>
+</html>
