@@ -1495,8 +1495,26 @@ function extractInvulnSave(profiles) {
   for (const p of profiles) {
     if (p.typeName === "Abilities") {
       const name = p.name || "";
+      // ListForge format: "Invulnerable Save 4+" in name
       let m = name.match(/Invulnerable Save (\d+)\+/);
       if (m) return parseInt(m[1], 10);
+      // NR formats: name starts with "Invulnerable Save" but value may be
+      // parenthesized, in description text, or absent from name entirely.
+      // e.g. "Invulnerable Save (4+)", "Invulnerable Save",
+      //      "Invulnerable Save: Fluxmaster"
+      if (/^Invulnerable Save/i.test(name)) {
+        // Try extracting digit from name (catches "Invulnerable Save (4+)")
+        let mn = name.match(/(\d+)\+/);
+        if (mn) return parseInt(mn[1], 10);
+        // Fall back to first N+ in description text
+        // (catches bare "4+", "This model has a 4+ invulnerable save.", etc.)
+        for (const c of (p.characteristics || [])) {
+          const txt = c.$text || "";
+          const mt = txt.match(/(\d+)\+/);
+          if (mt) return parseInt(mt[1], 10);
+        }
+      }
+      // Legacy text fallbacks for non-standard profile names
       for (const c of (p.characteristics || [])) {
         const txt = c.$text || "";
         m = txt.match(/Invulnerable Save (\d+)\+/i);
@@ -1760,6 +1778,16 @@ function processSelectionUnit(selection) {
   let points = 0;
   for (const cost of (selection.costs || [])) {
     if (cost.name === "pts") points = parseInt(cost.value, 10) || 0;
+  }
+  // Add enhancement/upgrade costs from direct upgrade children.
+  // BSData stores enhancement costs separately on upgrade selections,
+  // not baked into the parent unit cost.
+  for (const child of (selection.selections || [])) {
+    if (child.type === "upgrade") {
+      for (const cost of (child.costs || [])) {
+        if (cost.name === "pts") points += parseInt(cost.value, 10) || 0;
+      }
+    }
   }
   // BSData sometimes stores points on child model selections instead of the unit
   if (points === 0) {
