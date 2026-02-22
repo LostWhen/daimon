@@ -110,6 +110,14 @@ Additional testing from earlier development validated 254 profiles across 7 army
 
 **Combined NR:** 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zero errors. Enhancement points (9 units) correctly summed from upgrade children. Enhanced unit variants correctly deduplicated as separate profiles.
 
+**Automated Wahapedia ground-truth verification** (v0.73.23 — converter output compared field-by-field against [Wahapedia](https://wahapedia.ru/) CSV data exports using an automated verification harness):
+
+| Faction | Profiles | Stats Checked | Weapons Checked | Result |
+|---------|----------|---------------|-----------------|--------|
+| Custodes | 31/31 | T, Sv, W, Invuln | A, BS/WS, S, AP, D + keywords | 29/31 clean, 2 BSData↔Wahapedia source disagreements |
+
+The two flagged profiles are source data differences, not converter bugs: Telemon Heavy Dreadnought (BSData pre-bakes a conditional +2A bonus into the weapon stat) and Venatari Custodians (BSData and Wahapedia disagree on wounds — pending manual verification against the official Forge World datasheet).
+
 ## Technical Details
 
 - Single HTML file (~93KB), zero external dependencies
@@ -123,6 +131,23 @@ Additional testing from earlier development validated 254 profiles across 7 army
 *Daimon* — from Walter Jon Williams' novel [*Aristoi*](https://en.wikipedia.org/wiki/Aristoi_(novel)) (1992). The Aristoi partition their consciousness into daimones: specialized sub-processes that each handle a single task autonomously. This tool is a daimon — one job, one transformation, done.
 
 ## Version History
+
+### v0.73.23
+
+**Fix: Torrent weapons incorrectly assigned BS 4+ instead of null.**
+
+When BSData encodes a weapon's BS as `N/A` (the standard representation for Torrent weapons, which auto-hit and have no ballistic skill), the converter's `parseStatValue()` returned the string `"N/A"`. The weapon builder then checked `typeof chars.bs === 'number'`, found it false, and fell back to `bs: 4`. The same logic applied to WS.
+
+The fix distinguishes between "field is present but non-numeric" (set to `null`) and "field is completely absent" (keep the default of 4). This is a one-line change per field in `parseWeaponProfile()`.
+
+**Weapons affected in Custodes testing:**
+- Galatus warblade ranged profile (Contemptor-Galatus Dreadnought) — Torrent, Twin-linked, Ignores Cover
+- Twin plasma projector (Telemon Heavy Dreadnought) — Torrent, Twin-linked
+- Witchseeker flamer (Witchseekers) — Torrent, Ignores Cover
+
+**Simulation impact:** Low — UnitCrunch applies Torrent as auto-hit regardless of BS value, so the incorrect BS 4+ was effectively ignored. However, the profile data was wrong and would display incorrectly in UC's stat summary.
+
+**Validated:** Regression tested across all 14 test files (176 profiles, 13 factions). Zero errors, identical profile and deduplication counts.
 
 ### v0.73.22
 
