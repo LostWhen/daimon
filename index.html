@@ -3,8 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Daimon — BSData → UnitCrunch Converter</title>
-<meta name="description" content="Convert Warhammer 40K army lists from ListForge (BSData JSON) into UnitCrunch import files. Runs entirely in your browser.">
+<title>Daimon &mdash; BSData &rarr; UnitCrunch Converter</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -71,7 +70,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData → UnitCrunch Converter — Drop a ListForge / New Recruit JSON export to convert — v0.73.20</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &mdash; Drop a ListForge / New Recruit JSON export to convert &mdash; v0.73.21</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -493,6 +492,30 @@ function bracketKeywordToAbility(keyword, contextName) {
       `${contextName}: +${mVal} to damage (within half range)`,
       [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
       { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: mVal } },
+      ["unit"]
+    );
+  }
+  // Sustained Hits X (dynamic — handles values not in preset map)
+  const sustainedBracket = kwLower.match(/sustained hits\s+(\w+)/);
+  if (sustainedBracket) {
+    const displayVal = sustainedBracket[1].replace(/^d/i, 'D');
+    return makeUnitAbility(
+      `${contextName}: Sustained hits ${displayVal}`,
+      `${contextName}: Critical hit : ${displayVal} extra hits`,
+      [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+      makeSustainedEffect(displayVal),
+      ["unit"]
+    );
+  }
+  // Rapid Fire X (dynamic — handles values not in preset map)
+  const rapidBracket = kwLower.match(/rapid fire\s+(\w+)/);
+  if (rapidBracket) {
+    const displayVal = rapidBracket[1].replace(/^d/i, 'D');
+    return makeUnitAbility(
+      `${contextName}: Rapid fire ${displayVal}`,
+      `${contextName}: Increase attacks by ${displayVal} (within half range)`,
+      [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+      { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: displayVal, applyToExtraAttacks: false } },
       ["unit"]
     );
   }
@@ -1626,6 +1649,18 @@ function parseWeaponKeywords(keywordsText) {
           aliasActive: true, conditions: t.conditions, description: t.description,
           effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
         });
+      } else {
+        // Dynamic fallback for values not in preset map (e.g. Sustained Hits 3)
+        const rawVal = sustainedMatch[1];
+        const displayVal = rawVal.replace(/^d/i, 'D');
+        abilities.push({
+          aliases: [{ name: `Sustained hits ${displayVal}`, type: "reserved" }],
+          aliasActive: true,
+          conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+          description: `Critical hit : ${displayVal} extra hits`,
+          effect: makeSustainedEffect(displayVal),
+          scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
+        });
       }
       continue;
     }
@@ -1640,6 +1675,18 @@ function parseWeaponKeywords(keywordsText) {
           aliases: t.aliases.map(a => ({ ...a })),
           aliasActive: true, conditions: t.conditions, description: t.description,
           effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+        });
+      } else {
+        // Dynamic fallback for values not in preset map (e.g. Rapid Fire 3, 4, 5)
+        const rawVal = rapidMatch[1];
+        const displayVal = rawVal.replace(/^d/i, 'D');
+        abilities.push({
+          aliases: [{ name: `Rapid fire ${displayVal}`, type: "reserved" }],
+          aliasActive: true,
+          conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+          description: `Increase attacks by ${displayVal} (within half range)`,
+          effect: { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: displayVal, applyToExtraAttacks: false } },
+          scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
         });
       }
       continue;
