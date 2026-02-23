@@ -65,12 +65,30 @@
   #log .success { color: #4ecca3; }
   #log .error { color: #e94560; }
   #log .unit { color: #c4b5fd; }
+  #footer {
+    margin-top: 2rem;
+    text-align: center;
+    width: 100%;
+    max-width: 600px;
+  }
+  #footer .compat {
+    font-size: 0.75rem;
+    color: #666;
+    margin: 0.3rem 0;
+  }
+  #footer a {
+    color: #7ec8e3;
+    text-decoration: none;
+  }
+  #footer a:hover {
+    text-decoration: underline;
+  }
 </style>
 </head>
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &mdash; Drop a ListForge / New Recruit JSON export to convert &mdash; v0.73.23</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &mdash; Drop a ListForge / New Recruit JSON export to convert &mdash; v0.74.0</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -79,6 +97,18 @@
 <input type="file" id="file-input" accept=".json">
 
 <div id="log"></div>
+
+<div id="footer">
+  <p class="compat">
+    Daimon v0.74.0 &middot;
+    Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
+    <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
+  </p>
+  <p class="compat">
+    Also supports <a href="https://newrecruit.eu" target="_blank" rel="noopener">New Recruit</a> exports &middot;
+    <a href="https://github.com/LostWhen/daimon" target="_blank" rel="noopener">GitHub</a>
+  </p>
+</div>
 
 <script>
 // ── Minimal MessagePack encoder ──────────────────────────────────────────────
@@ -2083,6 +2113,140 @@ function log(text, cls = 'info') {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// ── ListForge Deep-Link Handler ─────────────────────────────────────────────
+async function handleListForgeDeepLink(encoded) {
+  logEl.innerHTML = '';
+  logEl.style.display = 'none';
+
+  // Update drop zone to show loading state
+  const dropZone = document.getElementById('drop-zone');
+  const originalContent = dropZone.innerHTML;
+  dropZone.innerHTML = '<div class="icon">⏳</div><p>Loading list from <strong>ListForge</strong>...</p>';
+
+  try {
+    // Step 1: Check browser support
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error(
+        'Your browser does not support DecompressionStream. ' +
+        'Please use a modern browser (Chrome 80+, Firefox 113+, Safari 16.4+, Edge 80+), ' +
+        'or export your list as a JSON file and drop it here instead.'
+      );
+    }
+
+    log('Decoding ListForge deep link...', 'info');
+
+    // Step 2: Base64 decode
+    const binaryString = atob(encoded);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    log(`Decoded base64: ${bytes.length} bytes compressed.`, 'info');
+
+    // Step 3: Gzip decompress using native DecompressionStream
+    const ds = new DecompressionStream('gzip');
+    const writer = ds.writable.getWriter();
+    writer.write(bytes);
+    writer.close();
+
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    const totalLength = chunks.reduce((s, c) => s + c.length, 0);
+    const decompressed = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      decompressed.set(chunk, offset);
+      offset += chunk.length;
+    }
+    log(`Decompressed: ${decompressed.length} bytes.`, 'info');
+
+    // Step 4: UTF-8 decode
+    const jsonString = new TextDecoder('utf-8').decode(decompressed);
+
+    // Step 5: JSON parse
+    const data = JSON.parse(jsonString);
+    log('Parsed JSON from ListForge deep link.', 'info');
+
+    // Step 6: Convert using existing pipeline
+    const rosterName = (data.roster || data).name || 'ListForge_Army';
+    const output = convert(data, rosterName + '.json');
+    const dupeCount = output._dupeCount;
+    const errors = output._errors;
+    delete output._dupeCount;
+    delete output._errors;
+    const count = output.profiles.length;
+
+    if (count === 0) {
+      throw new Error('No unit profiles found in this list.');
+    }
+
+    if (dupeCount > 0) {
+      log(`Skipped ${dupeCount} duplicate profile(s).`, 'info');
+    }
+
+    if (errors.length > 0) {
+      for (const err of errors) {
+        log(`  ⚠️ ${err}`, 'error');
+      }
+    }
+
+    let flaggedCount = 0;
+    for (const p of output.profiles) {
+      const mt = p.units[0].model_types;
+      const wCount = mt.reduce((s, m) => s + m.weapons.length, 0);
+      const aCount = p.units[0].abilities.length;
+      const flagged = p.units[0].abilities.filter(a => a.description && a.description.includes('⚠️ ENHANCEMENT STAT MOD')).length;
+      flaggedCount += flagged;
+      const aPart = aCount > 0 ? `, ${aCount} ability(ies)` : '';
+      const fPart = flagged > 0 ? ` ⚠️ ${flagged} stat mod(s) suppressed` : '';
+      log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}]`, 'unit');
+    }
+
+    if (flaggedCount > 0) {
+      log(`${flaggedCount} enhancement stat mod(s) set inactive (already baked into weapon profiles by BSData).`, 'info');
+    }
+
+    log(`Converted ${count} profile(s). Packing msgpack...`);
+
+    const packed = msgpack.encode(output);
+    log(`Packed ${packed.length} bytes.`, 'success');
+
+    // Auto-download
+    const outName = `${rosterName}_unitcrunch.txt`;
+    const blob = new Blob([packed], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = outName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    log(`Downloaded: ${outName}`, 'success');
+
+    // Restore drop zone with success message
+    dropZone.innerHTML =
+      '<div class="icon">✅</div>' +
+      `<p>Converted from <strong>ListForge</strong> &mdash; downloaded <strong>${outName}</strong></p>` +
+      '<p style="margin-top:0.8rem;font-size:0.85rem;color:#888;">Drop another <strong>.json</strong> file here to convert more</p>';
+
+  } catch (err) {
+    log(`Error: ${err.message}`, 'error');
+    log('Try exporting your list as a JSON file from ListForge and dropping it here instead.', 'info');
+    console.error('ListForge deep-link error:', err);
+
+    // Restore drop zone to normal state
+    dropZone.innerHTML = originalContent;
+  }
+}
+
 function handleFile(file) {
   logEl.innerHTML = '';
   logEl.style.display = 'none';
@@ -2174,6 +2338,21 @@ dropZone.addEventListener('drop', e => {
 });
 dropZone.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); fileInput.value = ''; });
+
+// ── Check for ListForge deep link on page load ─────────────────────────────
+(function checkDeepLink() {
+  const hash = window.location.hash;
+  const prefix = '#/listforge-json/';
+  if (hash.startsWith(prefix)) {
+    const encoded = hash.slice(prefix.length);
+    if (encoded.length > 0) {
+      // Clear the hash to prevent re-triggering on refresh
+      // Use replaceState to avoid adding a history entry
+      history.replaceState(null, '', window.location.pathname);
+      handleListForgeDeepLink(encoded);
+    }
+  }
+})();
 </script>
 </body>
 </html>
