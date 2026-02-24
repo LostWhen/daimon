@@ -88,7 +88,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &mdash; Drop a ListForge / New Recruit JSON export to convert &mdash; v0.74.0</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &mdash; Drop a ListForge / New Recruit JSON export to convert &mdash; v0.74.1</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -100,7 +100,7 @@
 
 <div id="footer">
   <p class="compat">
-    Daimon v0.74.0 &middot;
+    Daimon v0.74.1 &middot;
     Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
     <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
   </p>
@@ -1373,6 +1373,154 @@ function isOffensiveStatMod(ability) {
   return false;
 }
 
+// ── Pre-Bake Detection ──────────────────────────────────────────────────────
+// Detect stats that BSData has pre-baked from equipment or conditional abilities.
+// Returns an array of annotation objects: { sourceName, sourceType, detail }
+// sourceType: "equipment" | "once per battle"
+function detectPreBakes(selection) {
+  const annotations = [];
+  const seen = new Set();
+
+  function norm(text) {
+    return (text || "").replace(/\u00A0/g, ' ').replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201C\u201D]/g, '"').replace(/\*\*/g, '').replace(/\^\^/g, '');
+  }
+
+  // Extract which stats an ability text modifies
+  function describeStatMods(text) {
+    const stats = [];
+    if (/invulnerable save/i.test(text)) stats.push('invuln');
+    const chars = [
+      ['Attacks',    /attacks?\s+characteristic/i],
+      ['Strength',   /strength\s+characteristic/i],
+      ['Toughness',  /toughness\s+characteristic/i],
+      ['Sv',         /save\s+characteristic/i],
+      ['Wounds',     /wounds?\s+characteristic/i],
+      ['Movement',   /movement\s+characteristic/i],
+      ['Leadership', /leadership\s+characteristic/i],
+      ['Damage',     /damage\s+characteristic/i],
+      ['AP',         /(?:armour penetration|ap)\s+characteristic/i],
+      ['BS',         /(?:ballistic skill|bs)\s+characteristic/i],
+      ['WS',         /(?:weapon skill|ws)\s+characteristic/i],
+    ];
+    for (const [name, re] of chars) {
+      if (re.test(text)) stats.push(name);
+    }
+    return stats;
+  }
+
+  // Temporal restriction: "once per battle/game"
+  const TEMPORAL_RE = /once\s+per\s+(battle|game)/i;
+  // Stat/invuln modification: broad check for temporal validation
+  const STAT_CHANGE_RE = /invulnerable save|(?:attacks?|strength|toughness|save|wounds?|movement|leadership|damage|ap)\s+characteristic|(?:is\s+changed|changes?|becomes?)\s+to\s+\d+|add\s+\d+\s+to\s+the/i;
+  // Bracket keywords like [IGNORES COVER], [LETHAL HITS]
+  const BRACKET_KW_RE = /\[([A-Za-z][A-Za-z0-9 /'+]+)\]/gi;
+
+  function scanAbilityText(sourceName, text, sourceType) {
+    text = norm(text);
+    const key = `${sourceName}::${sourceType}`;
+    if (seen.has(key)) return;
+
+    const statMods = describeStatMods(text);
+    BRACKET_KW_RE.lastIndex = 0;
+    const hasBracketKw = BRACKET_KW_RE.test(text);
+    BRACKET_KW_RE.lastIndex = 0;
+    const isTemporal = TEMPORAL_RE.test(text);
+    const hasStatChange = statMods.length > 0 || STAT_CHANGE_RE.test(text);
+
+    // Temporal/conditional takes priority over equipment
+    if (isTemporal && (hasStatChange || hasBracketKw)) {
+      const tempKey = `${sourceName}::temporal`;
+      if (!seen.has(tempKey)) {
+        seen.add(tempKey);
+        seen.add(key);
+        const parts = [];
+        if (statMods.length > 0) parts.push(`Modifies ${statMods.join(' and ')}`);
+        if (hasBracketKw) {
+          const kws = [];
+          let m;
+          while ((m = BRACKET_KW_RE.exec(text)) !== null) kws.push(m[1].trim());
+          BRACKET_KW_RE.lastIndex = 0;
+          if (kws.length > 0) parts.push(`Grants ${kws.join(', ')}`);
+        }
+        const mods = parts.length > 0 ? parts.join('; ') : 'stats';
+        // Determine phase from text
+        let phaseDetail = 'temporarily (once per battle)';
+        const phaseMatch = text.match(/(fight|shooting|battle)\s+phase/i);
+        if (phaseMatch) {
+          phaseDetail = `for one ${phaseMatch[1].toLowerCase()} phase only`;
+        }
+        annotations.push({
+          sourceName,
+          sourceType: "once per battle",
+          detail: `${mods} ${phaseDetail}. Stats shown may include this temporary bonus.`
+        });
+      }
+      return;
+    }
+
+    // Equipment stat mods (non-temporal)
+    if (sourceType === "equipment") {
+      if (statMods.length > 0 || hasBracketKw) {
+        seen.add(key);
+        const parts = [];
+        if (statMods.length > 0) parts.push(`Modifies ${statMods.join(' and ')}`);
+        if (hasBracketKw) {
+          const kws = [];
+          let m;
+          while ((m = BRACKET_KW_RE.exec(text)) !== null) kws.push(m[1].trim());
+          BRACKET_KW_RE.lastIndex = 0;
+          parts.push(`Grants ${kws.join(', ')}`);
+        }
+        annotations.push({
+          sourceName,
+          sourceType: "equipment",
+          detail: parts.join('. ') + '. Stats shown include this bonus.'
+        });
+      }
+    }
+  }
+
+  // 1. Unit-level datasheet abilities (scan for temporal conditionals only)
+  for (const p of (selection.profiles || [])) {
+    if (p.typeName !== "Abilities") continue;
+    const aName = p.name || "";
+    if (/^Invulnerable Save/i.test(aName)) continue;
+    for (const c of (p.characteristics || [])) {
+      scanAbilityText(aName, c.$text || "", "ability");
+    }
+  }
+
+  // 2. Direct upgrade children (equipment, god marks, etc.)
+  for (const child of (selection.selections || [])) {
+    if (child.type !== "upgrade") continue;
+    for (const p of (child.profiles || [])) {
+      if (p.typeName !== "Abilities") continue;
+      const aName = p.name || child.name || "";
+      for (const c of (p.characteristics || [])) {
+        scanAbilityText(aName, c.$text || "", "equipment");
+      }
+    }
+  }
+
+  // 3. Model children → equipment upgrade abilities
+  for (const child of (selection.selections || [])) {
+    if (child.type !== "model") continue;
+    for (const equip of (child.selections || [])) {
+      if (equip.type !== "upgrade") continue;
+      for (const p of (equip.profiles || [])) {
+        if (p.typeName !== "Abilities") continue;
+        const aName = p.name || equip.name || "";
+        for (const c of (p.characteristics || [])) {
+          scanAbilityText(aName, c.$text || "", "equipment");
+        }
+      }
+    }
+  }
+
+  return annotations;
+}
+
 // Collect all abilities from a selection's profiles, rules, and child upgrades
 function extractParsedAbilities(selection) {
   const abilities = [];
@@ -1840,6 +1988,24 @@ function processSelectionUnit(selection) {
 
   // Extract combat-relevant abilities from text
   const { abilities: parsedAbilities, textInvuln } = extractParsedAbilities(selection);
+
+  // Detect pre-baked stats and add annotation abilities.
+  // Must use a real UnitCrunch effect type — UC silently drops abilities with unknown types.
+  // Uses modifyRelative +0 to wound roll: structurally valid, mechanically no-op.
+  // aliasActive: false so it renders as an unchecked box (same as isOffensiveStatMod pattern).
+  const preBakes = detectPreBakes(selection);
+  for (const pb of preBakes) {
+    const annot = makeUnitAbility(
+      `\u26A0 Pre-baked: ${pb.sourceName}`,
+      `${pb.sourceName} (${pb.sourceType}): ${pb.detail}`,
+      [], // no conditions
+      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 0 } },
+      ["unit"]
+    );
+    annot.aliasActive = false;
+    parsedAbilities.push(annot);
+  }
+
   // Use text-parsed invuln as fallback (e.g. "models in this unit have a 5+ invulnerable save")
   if (invuln == null && textInvuln != null) invuln = textInvuln;
   // Also search full selection tree for UNIT-WIDE invulns on model equipment
@@ -2197,19 +2363,26 @@ async function handleListForgeDeepLink(encoded) {
     }
 
     let flaggedCount = 0;
+    let prebakeCount = 0;
     for (const p of output.profiles) {
       const mt = p.units[0].model_types;
       const wCount = mt.reduce((s, m) => s + m.weapons.length, 0);
       const aCount = p.units[0].abilities.length;
       const flagged = p.units[0].abilities.filter(a => a.description && a.description.includes('⚠️ ENHANCEMENT STAT MOD')).length;
+      const prebaked = p.units[0].abilities.filter(a => a.aliases && a.aliases[0] && a.aliases[0].name.startsWith('\u26A0 Pre-baked:')).length;
       flaggedCount += flagged;
+      prebakeCount += prebaked;
       const aPart = aCount > 0 ? `, ${aCount} ability(ies)` : '';
       const fPart = flagged > 0 ? ` ⚠️ ${flagged} stat mod(s) suppressed` : '';
-      log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}]`, 'unit');
+      const pbPart = prebaked > 0 ? ` \u26A0 ${prebaked} pre-bake note(s)` : '';
+      log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}${pbPart}]`, 'unit');
     }
 
     if (flaggedCount > 0) {
       log(`${flaggedCount} enhancement stat mod(s) set inactive (already baked into weapon profiles by BSData).`, 'info');
+    }
+    if (prebakeCount > 0) {
+      log(`${prebakeCount} pre-bake annotation(s) added (equipment/ability bonuses detected in stats).`, 'info');
     }
 
     log(`Converted ${count} profile(s). Packing msgpack...`);
@@ -2287,19 +2460,26 @@ function handleFile(file) {
       }
 
       let flaggedCount = 0;
+      let prebakeCount = 0;
       for (const p of output.profiles) {
         const mt = p.units[0].model_types;
         const wCount = mt.reduce((s, m) => s + m.weapons.length, 0);
         const aCount = p.units[0].abilities.length;
         const flagged = p.units[0].abilities.filter(a => a.description && a.description.includes('⚠️ ENHANCEMENT STAT MOD')).length;
+        const prebaked = p.units[0].abilities.filter(a => a.aliases && a.aliases[0] && a.aliases[0].name.startsWith('\u26A0 Pre-baked:')).length;
         flaggedCount += flagged;
+        prebakeCount += prebaked;
         const aPart = aCount > 0 ? `, ${aCount} ability(ies)` : '';
         const fPart = flagged > 0 ? ` ⚠️ ${flagged} stat mod(s) suppressed` : '';
-        log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}]`, 'unit');
+        const pbPart = prebaked > 0 ? ` \u26A0 ${prebaked} pre-bake note(s)` : '';
+        log(`  ${p.name}  [${p.computed_points}pts, ${p.computed_model_count} model(s), ${wCount} weapon(s)${aPart}${fPart}${pbPart}]`, 'unit');
       }
 
       if (flaggedCount > 0) {
         log(`${flaggedCount} enhancement stat mod(s) set inactive (already baked into weapon profiles by BSData).`, 'info');
+      }
+      if (prebakeCount > 0) {
+        log(`${prebakeCount} pre-bake annotation(s) added (equipment/ability bonuses detected in stats).`, 'info');
       }
 
       log(`Converted ${count} profile(s). Packing msgpack...`);

@@ -66,6 +66,7 @@ Everything that UnitCrunch can simulate is extracted and mapped automatically.
 | Benefit of Cover | Detected from description text |
 | Conditional abilities | "Once per battle" / "until end of phase" → start inactive; user toggles on in UC |
 | Leader auras | "While this model is leading a unit" → start active |
+| Pre-bake annotations | Equipment and conditional ability bonuses baked into stats by BSData → flagged as informational notes |
 
 ---
 
@@ -173,6 +174,20 @@ Combined NR: 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zer
 ---
 
 ## Version History
+
+### v0.74.1
+**Pre-bake annotation system (Phase 1).**
+
+BSData sometimes pre-bakes equipment or conditional ability bonuses directly into unit stat lines. Users running simulations in UnitCrunch had no way to know which stats included these bonuses vs. base datasheet values. Daimon now detects pre-baked stats and adds informational annotations to each affected profile.
+
+What gets detected:
+- **Equipment stat modifications** — Invulnerable saves from shields/wargear, Leadership from Daemonic Icons, Wounds from Relic Shields, Attacks from god-specific marks (Tzeentch +3A)
+- **Equipment weapon keyword grants** — Icon of Flame granting Ignores Cover, Gitfinder Gogglez granting Ignores Cover
+- **Once-per-battle conditional abilities** — Abilities that temporarily modify stats or grant weapon keywords for one phase only (Distraction Grot, Ammo Runt, Finest Hour, Thrilling Spectacle)
+
+Annotations appear as unchecked abilities in UnitCrunch's abilities panel, named `⚠ Pre-baked: {source}` with a description explaining what's modified and whether the bonus is permanent (equipment) or temporary (once per battle). Equipment annotations say "Stats shown include this bonus." Temporal annotations say "Stats shown may include this temporary bonus."
+
+Tested across 5 faction files (145 units): 22 annotations detected, 0 false positives.
 
 ### v0.74.0
 **ListForge deep-link integration.**
