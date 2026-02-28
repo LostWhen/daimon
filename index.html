@@ -88,7 +88,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.75.1</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.75.2</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -100,7 +100,7 @@
 
 <div id="footer">
   <p class="compat">
-    Daimon v0.75.1 &middot;
+    Daimon v0.75.2 &middot;
     Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
     <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
   </p>
@@ -456,32 +456,117 @@ const KEYWORD_ABILITY_MAP = {
   }
 };
 
+// ── UC-Format Helper Functions ───────────────────────────────────────────────
+
+function ucModifyRelativeEffect(appTitle, appKey, opTitle, opKey, value) {
+  return {
+    text: "Modify (relative)",
+    type: "modifyRelative",
+    data: {
+      application: { title: appTitle, key: appKey },
+      operator: { title: opTitle, key: opKey },
+      relativeValue: value
+    }
+  };
+}
+
+function ucAttackTypeCondition(type) {
+  return {
+    text: "Attack type",
+    type: "attackType",
+    data: { attackType: type === "ranged" ? "Ranged" : "Melee" },
+    description: "Restrict to just melee attacks or ranged attacks.",
+    preselected: false
+  };
+}
+
+function ucPsychicAttackCondition() {
+  return {
+    text: "Psychic attack",
+    type: "psychicAttack",
+    data: { psychicAttack: { title: "Attack is psychic", key: "attackIsPsychic" } },
+    description: "Whether an attack is psychic.",
+    preselected: false,
+    scope: ["global", "profile"]
+  };
+}
+
 // ── Ability Text → UnitCrunch Ability Parsers ───────────────────────────────
 // Each parser receives {name, description, source} and returns a UnitCrunch
 // ability object (or null). source is "ability"|"rule"|"enhancement".
 // Abilities go on the unit, not individual weapons.
 
-function makeUnitAbility(name, description, role, conditions, effect, scope) {
+function makeUnitAbility(aliasLabel, descriptionGrammar, role, conditions, effect, scope) {
   const profileRoleCondition = {
-    text: "Profile role (preselected)",
+    text: "Profile role",
     type: "profileRole",
-    data: { profileRole: {
-      title: role === "defender" ? "Defender" : "Attacker",
-      key: role === "defender" ? "defender" : "attacker"
-    }},
-    description: "Active when this profile is in the specified role.",
+    data: { profileRole: role === "defender" ? "Defender" : "Attacker" },
+    description: "Require the current profile to be set as the attacker or defender.",
     preselected: true
   };
   return {
     id: genUUID(),
-    aliases: [{ name, type: "custom" }],
+    aliases: [{ name: aliasLabel, type: "custom" }],
     aliasActive: true,
     conditions: [profileRoleCondition, ...(conditions || [])],
-    description,
+    description: descriptionGrammar,
     effect,
-    scope: scope || ["unit"],
+    scope: scope || ["profile"],
     sharedWithAllUnits: false
   };
+}
+
+// ── Stat Bake Candidate Detection ─────────────────────────────────────────────
+// Determines if an ability should be baked directly into weapon stats.
+// Only self-applying, always-on abilities qualify.
+function isStatBakeCandidate(desc) {
+  // Aura: "While a friendly [X] unit is within N" of this model" → always true for bearer
+  if (/while\s+(?:a\s+)?friendly\s+.*?unit\s+is\s+within\s+\d+"?\s*of\s+this\s+model/i.test(desc)) {
+    return true;
+  }
+  // Direct self-targeting with no conditional language
+  if (/(?:models? in this unit|this model'?s|this unit'?s|equipped by models? in this unit)/i.test(desc)) {
+    if (!hasConditionalLanguage(desc)) return true;
+  }
+  return false;
+}
+
+function hasConditionalLanguage(desc) {
+  return /once per battle/i.test(desc) ||
+    /wounds? remaining/i.test(desc) ||
+    /Charge move/i.test(desc) ||
+    /select one/i.test(desc) ||
+    /if (?:it|this unit|this model) does/i.test(desc) ||
+    /spend \d+/i.test(desc) ||
+    /(?:while|when).*?Empowered/i.test(desc) ||
+    /at the (?:start|end) of/i.test(desc) ||
+    /the first time/i.test(desc) ||
+    /is active for/i.test(desc) ||
+    /leading a unit/i.test(desc) ||
+    /for (?:each|every) (?:\d+\s*)?(?:model|other)/i.test(desc) ||
+    /roll .{0,15}D\d/i.test(desc) ||
+    /destroyed .{0,20}(?:unit|model)/i.test(desc) ||
+    /closest eligible/i.test(desc) ||
+    /embarked/i.test(desc) ||
+    /that targets .{0,30}(?:within|closest)/i.test(desc);
+}
+
+// Detect weapon scope for stat bakes. Handles both "ranged attack" and "ranged weapon" phrasings.
+function getStatBakeScope(desc) {
+  const hasRanged = /ranged (?:attack|weapon)/i.test(desc);
+  const hasMelee = /melee (?:attack|weapon)/i.test(desc) || (/melee/i.test(desc) && !hasRanged);
+  if (hasRanged && !hasMelee) return "ranged";
+  if (hasMelee && !hasRanged) return "melee";
+  return "all";
+}
+
+// Extract keyword filter from aura description for self-application verification.
+// e.g. "While a friendly TZEENTCH LEGIONES DAEMONICA unit is within 6"" → "TZEENTCH LEGIONES DAEMONICA"
+function getAuraKeywordFilter(desc) {
+  const m = desc.match(/while\s+(?:a\s+)?friendly\s+(.+?)\s+unit\s+is\s+within\s+\d+/i);
+  if (!m) return null;
+  // Strip markup characters (^^, **, etc.)
+  return m[1].replace(/[\^*]/g, '').trim().toUpperCase();
 }
 
 // Extract bracket keywords like [LETHAL HITS], [SUSTAINED HITS D3] from text
@@ -496,19 +581,38 @@ function extractBracketKeywords(text) {
   return results;
 }
 
-// Convert a bracket keyword to a unit-scope ability using KEYWORD_ABILITY_MAP
+// Convert a bracket keyword to a profile-scope ability using KEYWORD_ABILITY_MAP
 function bracketKeywordToAbility(keyword, contextName) {
   const kwLower = keyword.toLowerCase().replace(/\s+/g, ' ');
   // Direct match
   if (KEYWORD_ABILITY_MAP[kwLower]) {
     const t = KEYWORD_ABILITY_MAP[kwLower];
+    // Profile-level Ignore Cover uses different effect type than weapon-level
+    if (kwLower === "ignores cover") {
+      return makeUnitAbility(
+        `${contextName}: Ignores cover`,
+        "Ignore cover (if attacker)",
+        "attacker",
+        [],
+        { text: "Special", type: "special", data: { option: { title: "Ignore cover", key: "ignoreCover" } } }
+      );
+    }
+    // Profile-level lethal hits uses different grammar than weapon-level
+    if (kwLower === "lethal hits") {
+      return makeUnitAbility(
+        `${contextName}: Lethal hits`,
+        "Critical hit : always wound (if attacker)",
+        "attacker",
+        t.conditions,
+        t.effect
+      );
+    }
     return makeUnitAbility(
       `${contextName}: ${t.aliases[0].name}`,
-      `${contextName}: ${t.description}`,
+      `${t.description} (if attacker)`,
       "attacker",
       t.conditions,
-      t.effect,
-      ["unit"]
+      t.effect
     );
   }
   // Anti-X pattern
@@ -516,14 +620,48 @@ function bracketKeywordToAbility(keyword, contextName) {
   if (antiMatch) {
     const target = antiMatch[1].toUpperCase();
     const threshold = parseInt(antiMatch[2], 10);
-    return makeUnitAbility(
-      `${contextName}: Anti-${target} ${threshold}+`,
-      `${contextName}: Critical wound on ${threshold}+ (vs ${target})`,
+    const ability = makeUnitAbility(
+      `Anti-${target} ${threshold}+`,
+      `Wound roll of ${threshold}+ (unmodified) : critical wound (${target} only)`,
       "attacker",
-      [{ text: "Keyword", type: "keyword", data: { keyword: target }, description: `Target has ${target} keyword.`, preselected: false }],
-      { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWound" }, absoluteValue: threshold } },
-      ["unit"]
+      [
+        {
+          text: "Keywords (only)",
+          type: "keywordsOnly",
+          data: { keywords: [target] },
+          description: "Require one or more keywords.",
+          preselected: false,
+          scope: ["global", "profile", "weapon"]
+        },
+        {
+          text: "Attack step roll",
+          type: "attackStepRoll",
+          data: {
+            attackStep: { title: "Wound roll", key: "woundRoll" },
+            rollReq: { title: "Specific roll", key: "specificRoll" },
+            rollState: { title: "Unmodified", key: "unmodified" },
+            rollTarget: { title: "Or greater", key: "orGreater" },
+            rollValue: String(threshold)
+          },
+          description: "Require a specific roll value in the attack sequence.",
+          preselected: false,
+          scope: ["global", "profile", "weapon"]
+        }
+      ],
+      {
+        text: "Override requirements",
+        type: "overrideReqs",
+        data: {
+          crit: true,
+          irrespective: false,
+          outcome: { title: "Wound", key: "wound" },
+          type: { title: "Always", key: "always" }
+        }
+      }
     );
+    // UC expects "reserved" for standard keywords, makeUnitAbility sets "custom"
+    ability.aliases[0].type = "reserved";
+    return ability;
   }
   // Melta X
   const meltaMatch = kwLower.match(/melta\s+(\d+)/);
@@ -531,24 +669,23 @@ function bracketKeywordToAbility(keyword, contextName) {
     const mVal = parseInt(meltaMatch[1], 10);
     return makeUnitAbility(
       `${contextName}: Melta ${mVal}`,
-      `${contextName}: +${mVal} to damage (within half range)`,
+      `+${mVal} to damage (within half range) (if attacker)`,
       "attacker",
       [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
-      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: mVal } },
-      ["unit"]
+      ucModifyRelativeEffect("Damage", "damage", "Add", "add", mVal)
     );
   }
   // Sustained Hits X (dynamic — handles values not in preset map)
   const sustainedBracket = kwLower.match(/sustained hits\s+(\w+)/);
   if (sustainedBracket) {
     const displayVal = sustainedBracket[1].replace(/^d/i, 'D');
+    const plural = displayVal === "1" ? "" : "s";
     return makeUnitAbility(
       `${contextName}: Sustained hits ${displayVal}`,
-      `${contextName}: Critical hit : ${displayVal} extra hits`,
+      `Critical hit : ${displayVal} extra hit${plural} (if attacker)`,
       "attacker",
       [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
-      makeSustainedEffect(displayVal),
-      ["unit"]
+      makeSustainedEffect(displayVal)
     );
   }
   // Rapid Fire X (dynamic — handles values not in preset map)
@@ -557,11 +694,10 @@ function bracketKeywordToAbility(keyword, contextName) {
     const displayVal = rapidBracket[1].replace(/^d/i, 'D');
     return makeUnitAbility(
       `${contextName}: Rapid fire ${displayVal}`,
-      `${contextName}: Increase attacks by ${displayVal} (within half range)`,
+      `Increase attacks by ${displayVal} (within half range) (if attacker)`,
       "attacker",
       [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
-      { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: displayVal, applyToExtraAttacks: false } },
-      ["unit"]
+      { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: displayVal, applyToExtraAttacks: false } }
     );
   }
   return null;
@@ -578,11 +714,10 @@ const ABILITY_PARSERS = [
       const val = parseInt(m[1], 10);
       return makeUnitAbility(
         `Feel No Pain ${val}+`,
-        `Feel No Pain ${val}+`,
+        `Feel no pain ${val}+`,
         "defender",
         [],
-        { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
-        ["unit"]
+        { text: "Feel no pain", type: "feelNoPain", data: { value: String(val) } }
       );
     }
     // Ability profile format: name = "Feel No Pain", desc = "5+" or "4+"
@@ -592,11 +727,10 @@ const ABILITY_PARSERS = [
         const val = parseInt(md[1], 10);
         return makeUnitAbility(
           `Feel No Pain ${val}+`,
-          `Feel No Pain ${val}+`,
+          `Feel no pain ${val}+`,
           "defender",
           [],
-          { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
-          ["unit"]
+          { text: "Feel no pain", type: "feelNoPain", data: { value: String(val) } }
         );
       }
     }
@@ -613,13 +747,14 @@ const ABILITY_PARSERS = [
     const hasPsychic = /Psychic/i.test(desc);
     const hasMortal = /mortal wound/i.test(desc);
     const label = hasPsychic && hasMortal ? 'vs Psychic & mortals' : hasPsychic ? 'vs Psychic' : hasMortal ? 'vs mortals' : 'conditional';
+    const conditions = [];
+    if (hasPsychic) conditions.push(ucPsychicAttackCondition());
     const ability = makeUnitAbility(
       `${name}: FNP ${val}+ (${label})`,
-      `${name}: Feel No Pain ${val}+ against ${hasPsychic ? 'Psychic Attacks' : ''}${hasPsychic && hasMortal ? ' and ' : ''}${hasMortal ? 'mortal wounds' : ''}`,
+      `Feel no pain ${val}+${hasPsychic ? ' (if attack is psychic)' : ''}`,
       "defender",
-      [],
-      { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
-      ["unit"]
+      conditions,
+      { text: "Feel no pain", type: "feelNoPain", data: { value: String(val) } }
     );
     // These are always conditional (only vs specific damage types) — start inactive for toggle
     ability.aliasActive = false;
@@ -648,11 +783,10 @@ const ABILITY_PARSERS = [
 
     const ability = makeUnitAbility(
       `${name}: FNP ${val}+`,
-      `${name}: Feel No Pain ${val}+${isLeaderAura ? ' (while leading)' : ''}${isConditional ? ' (conditional)' : ''}`,
+      `Feel no pain ${val}+`,
       "defender",
       [],
-      { text: "Feel no pain", type: "fnp", data: { fnpValue: val } },
-      ["unit"]
+      { text: "Feel no pain", type: "feelNoPain", data: { value: String(val) } }
     );
     // Conditional/once-per-battle effects start inactive
     if (isConditional && !isLeaderAura) ability.aliasActive = false;
@@ -664,11 +798,10 @@ const ABILITY_PARSERS = [
     if (name !== "Stealth") return null;
     return makeUnitAbility(
       "Stealth",
-      "-1 to hit roll (ranged attacks targeting this unit)",
+      "-1 to hit roll (ranged only) (if defender)",
       "defender",
-      [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false }],
-      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-      ["unit"]
+      [ucAttackTypeCondition("ranged")],
+      ucModifyRelativeEffect("Hit roll", "hitRoll", "Subtract", "subtract", 1)
     );
   },
 
@@ -678,12 +811,11 @@ const ABILITY_PARSERS = [
     if (!m) return null;
     if (/subtract 1 from the Hit roll/i.test(desc)) {
       return makeUnitAbility(
-        name,
-        "When damaged: -1 to hit rolls",
+        `Damaged: ${m[1]}-${m[2]} wounds remaining`,
+        "-1 to hit roll (if attacker)",
         "attacker",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Hit roll", "hitRoll", "Subtract", "subtract", 1)
       );
     }
     return null;
@@ -821,16 +953,20 @@ const ABILITY_PARSERS = [
       }
       const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
 
       results.push(makeUnitAbility(
         `${name}: +1 to hit`,
-        `${name}: +1 to hit roll`,
+        `+1 to hit roll${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Hit roll", "hitRoll", "Add", "add", 1)
       ));
     }
     // "subtract 1 from the Hit roll" (defensive, for damaged brackets — handled above, but catch generic)
@@ -852,27 +988,30 @@ const ABILITY_PARSERS = [
       }
       const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
 
       results.push(makeUnitAbility(
         `${name}: +1 to wound`,
-        `${name}: +1 to wound roll`,
+        `+1 to wound roll${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Wound roll", "woundRoll", "Add", "add", 1)
       ));
     }
     // Defensive: subtract 1 from wound roll (when targeted)
     if (/subtract 1 from the Wound roll/i.test(desc) && /attack targets/i.test(desc)) {
       results.push(makeUnitAbility(
         `${name}: -1 to wound (defending)`,
-        `${name}: -1 to wound roll (attacks targeting this unit)`,
+        "-1 to wound roll (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Wound roll", "woundRoll", "Subtract", "subtract", 1)
       ));
     }
     return results.length ? results : null;
@@ -883,11 +1022,10 @@ const ABILITY_PARSERS = [
     if (/subtract 1 from (?:the |that attack's )Damage characteristic/i.test(desc)) {
       return makeUnitAbility(
         `${name}: -1 Damage`,
-        `${name}: Subtract 1 from Damage characteristic of attacks allocated to this model`,
+        "-1 to damage (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Damage", "damage", "Subtract", "subtract", 1)
       );
     }
     return null;
@@ -902,16 +1040,30 @@ const ABILITY_PARSERS = [
       const rangedOnly = /ranged attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc);
       const conditions = [];
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-      results.push(makeUnitAbility(
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
+      const ability = makeUnitAbility(
         `${name}: +${val} Strength`,
-        `${name}: +${val} to Strength${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
+        `+${val} to strength${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
-        ["unit"]
-      ));
+        ucModifyRelativeEffect("Strength", "strength", "Add", "add", val)
+      );
+      if (isStatBakeCandidate(desc)) {
+        ability._bakeable = true;
+        ability._bakeStat = "strength";
+        ability._bakeValue = val;
+        ability._bakeScope = getStatBakeScope(desc);
+        const kw = getAuraKeywordFilter(desc);
+        if (kw) ability._bakeKeyword = kw;
+      }
+      results.push(ability);
     }
     // "improve the Strength [and X [and Y]] characteristics ... by N"
     // e.g. "improve the Strength and Damage characteristics of that attack by 1"
@@ -922,17 +1074,30 @@ const ABILITY_PARSERS = [
       const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
       const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
       const conditions = [];
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
       const ability = makeUnitAbility(
         `${name}: +${val} Strength`,
-        `${name}: +${val} to Strength${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+        `+${val} to strength${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
-        ["unit"]
+        ucModifyRelativeEffect("Strength", "strength", "Add", "add", val)
       );
       ability.aliasActive = false;
+      if (isStatBakeCandidate(desc)) {
+        ability._bakeable = true;
+        ability._bakeStat = "strength";
+        ability._bakeValue = val;
+        ability._bakeScope = getStatBakeScope(desc);
+        const kw = getAuraKeywordFilter(desc);
+        if (kw) ability._bakeKeyword = kw;
+      }
       results.push(ability);
     }
     return results.length ? results : null;
@@ -953,35 +1118,72 @@ const ABILITY_PARSERS = [
     if (weaponRefMatch) {
       weaponTarget = weaponRefMatch[1].trim();
     }
+    // Save weapon reference for select-one annotation before it gets cleared
+    const weaponRef = weaponTarget;
     // "Select one" abilities must stay as toggleable profile abilities, not weapon-level.
-    // e.g. Master of Magicks: "select one of the following abilities: [IGNORES COVER]; [LETHAL HITS]; [SUSTAINED HITS D3]"
-    if (/select one of the (?:following|abilities)/i.test(desc)) {
+    // Matches "select one of the following/abilities/stances/etc." but NOT "selected to shoot/fight"
+    if (/select one of the\b/i.test(desc)) {
       selectOne = true;
       weaponTarget = null; // don't move to weapon-level
     }
 
-    // Determine attackType condition for select-one abilities (Shooting phase → Ranged)
-    const selectOneRanged = selectOne && /shooting phase/i.test(desc);
-    const selectOneMelee = selectOne && /(?:fight phase|selected to fight)/i.test(desc);
-    const attackTypeRanged = { text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false };
-    const attackTypeMelee = { text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false };
+    // Phase 4: Detect self-applying weapon scope (allRanged/allMelee/all)
+    // Only for non-select-one, non-weapon-targeted abilities that grant keywords to own weapons
+    let weaponScope = null;
+    if (!selectOne && !weaponTarget) {
+      const selfApplying =
+        /equipped\s+by\s+models?\s+in\s+(?:this|that)\s+(?:unit|model's\s+unit)/i.test(desc) ||
+        /equipped\s+by\s+this\s+model/i.test(desc) ||
+        /equipped\s+by\s+the\s+bearer/i.test(desc) ||
+        /(?:bearer's|this model's|its)\s+(?:\w+\s+)*?weapons?\s+have/i.test(desc) ||
+        /weapons?\s+(?:it\s+is\s+)?equipped\s+with\s+have/i.test(desc);
+      if (selfApplying) {
+        if (/\branged\s+weapons?\b/i.test(desc) && !/\bmelee\s+weapons?\b/i.test(desc)) weaponScope = "allRanged";
+        else if (/\bmelee\s+weapons?\b/i.test(desc) && !/\branged\s+weapons?\b/i.test(desc)) weaponScope = "allMelee";
+        else weaponScope = "all";
+      }
+    }
 
-    // Filter to only combat-relevant keywords we can map
+    // Phase 4: Select-one → single annotation instead of multiple broken custom abilities
+    if (selectOne) {
+      const kwNames = [];
+      for (const kw of brackets) {
+        const kwLower = kw.toLowerCase().replace(/\s+/g, ' ');
+        const t = KEYWORD_ABILITY_MAP[kwLower];
+        if (t) { kwNames.push(t.aliases[0].name); continue; }
+        const sh = kwLower.match(/sustained hits\s+(\w+)/);
+        if (sh) { kwNames.push('Sustained hits ' + sh[1].replace(/^d/i, 'D')); continue; }
+        // Skip non-ability bracket text like [excluding VEHICLES]
+        if (/^(?:anti|melta|rapid fire|lethal|ignores|precision|devastating)/i.test(kw)) kwNames.push(kw);
+      }
+      if (kwNames.length === 0) return null;
+      const weaponNote = weaponRef ? ` for ${weaponRef}` : '';
+      const annotation = makeUnitAbility(
+        `\u26A0 Select ONE${weaponNote}: ${kwNames.join(' / ')} \u2014 add via Preset abilities`,
+        `${name}: Select one of: ${kwNames.join(', ')}. Add the chosen ability via the Preset abilities button in UC.`,
+        "attacker",
+        [],
+        { text: "Special", type: "special", data: {} },
+        ["unit"]
+      );
+      annotation.aliasActive = false;
+      return [annotation];
+    }
+
+    // Non-select-one: process each keyword
     const abilities = [];
     for (const kw of brackets) {
       const ability = bracketKeywordToAbility(kw, name);
       if (ability) {
         // Tag with weapon target for post-processing in processSelectionUnit
         if (weaponTarget) ability._weaponTarget = weaponTarget;
-        if (selectOne) {
-          ability.aliasActive = false;
-          // Append select-ONE warning to alias name
-          if (ability.aliases && ability.aliases[0]) {
-            ability.aliases[0].name += " \u2014 select ONE";
-          }
-          // Add attackType condition
-          if (selectOneRanged) ability.conditions.push(attackTypeRanged);
-          else if (selectOneMelee) ability.conditions.push(attackTypeMelee);
+        // Phase 4: Tag for weapon-level routing if keyword has reserved template
+        const kwLower = kw.toLowerCase().replace(/\s+/g, ' ');
+        const kwTemplate = KEYWORD_ABILITY_MAP[kwLower];
+        if (kwTemplate && (weaponTarget || weaponScope)) {
+          ability._weaponAbility = true;
+          ability._kwTemplate = kwTemplate;
+          if (weaponScope) ability._weaponScope = weaponScope;
         }
         abilities.push(ability);
       }
@@ -1028,11 +1230,10 @@ const ABILITY_PARSERS = [
     if (/(?:has|have) the Benefit of Cover/i.test(desc) && !/cannot have the Benefit of Cover/i.test(desc)) {
       return makeUnitAbility(
         `${name}: Benefit of Cover`,
-        `${name}: Has the Benefit of Cover`,
+        "Has cover (if defender)",
         "defender",
         [],
-        { text: "Special", type: "special", data: { option: { title: "Has cover", key: "hasCover" } } },
-        ["unit"]
+        { text: "Special", type: "special", data: { option: { title: "Has cover", key: "hasCover" } } }
       );
     }
     return null;
@@ -1043,11 +1244,10 @@ const ABILITY_PARSERS = [
     if (/halve the Damage characteristic/i.test(desc)) {
       return makeUnitAbility(
         `${name}: Half damage`,
-        `${name}: Halve the Damage characteristic of attacks allocated to this model`,
+        "Halve damage (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Divide by", key: "divide" }, relativeValue: "2" } },
-        ["unit"]
+        ucModifyRelativeEffect("Damage", "damage", "Divide by", "divide", "2")
       );
     }
     return null;
@@ -1063,28 +1263,78 @@ const ABILITY_PARSERS = [
       const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
       const conditions = [];
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
+      conditions.push({
+        text: "Attack step roll",
+        type: "attackStepRoll",
+        data: {
+          attackStep: { title: "Hit roll", key: "hitRoll" },
+          rollReq: { title: "Specific roll", key: "specificRoll" },
+          rollState: { title: "Unmodified", key: "unmodified" },
+          rollTarget: { title: "Or greater", key: "orGreater" },
+          rollValue: String(threshold)
+        },
+        description: "Require a specific roll value in the attack sequence.",
+        preselected: false,
+        scope: ["global", "profile", "weapon"]
+      });
       results.push(makeUnitAbility(
         `${name}: Critical hits on ${threshold}+`,
-        `${name}: Unmodified Hit roll of ${threshold}+ scores a Critical Hit`,
+        `Hit roll of ${threshold}+ (unmodified) : critical hit${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical hit threshold", key: "critHitThreshold" }, absoluteValue: threshold } },
-        ["unit"]
+        {
+          text: "Override requirements",
+          type: "overrideReqs",
+          data: {
+            crit: true,
+            irrespective: false,
+            outcome: { title: "Hit", key: "hit" },
+            type: { title: "Always", key: "always" }
+          }
+        }
       ));
     }
     // "Wound roll of 5+ scores a Critical Wound"
     const mw = desc.match(/(?:unmodified\s+)?Wound roll of (\d)\+\s*scores a Critical Wound/i);
     if (mw) {
       const threshold = parseInt(mw[1], 10);
+      const woundConditions = [{
+        text: "Attack step roll",
+        type: "attackStepRoll",
+        data: {
+          attackStep: { title: "Wound roll", key: "woundRoll" },
+          rollReq: { title: "Specific roll", key: "specificRoll" },
+          rollState: { title: "Unmodified", key: "unmodified" },
+          rollTarget: { title: "Or greater", key: "orGreater" },
+          rollValue: String(threshold)
+        },
+        description: "Require a specific roll value in the attack sequence.",
+        preselected: false,
+        scope: ["global", "profile", "weapon"]
+      }];
       results.push(makeUnitAbility(
         `${name}: Critical wounds on ${threshold}+`,
-        `${name}: Unmodified Wound roll of ${threshold}+ scores a Critical Wound`,
+        `Wound roll of ${threshold}+ (unmodified) : critical wound (if attacker)`,
         "attacker",
-        [],
-        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWoundThreshold" }, absoluteValue: threshold } },
-        ["unit"]
+        woundConditions,
+        {
+          text: "Override requirements",
+          type: "overrideReqs",
+          data: {
+            crit: true,
+            irrespective: false,
+            outcome: { title: "Wound", key: "wound" },
+            type: { title: "Always", key: "always" }
+          }
+        }
       ));
     }
     return results.length ? results : null;
@@ -1098,16 +1348,44 @@ const ABILITY_PARSERS = [
       const meleeOnly = /melee attack/i.test(desc);
       const rangedOnly = /ranged attack/i.test(desc) && !meleeOnly;
       const conditions = [];
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
       // In 40K, 1s always fail, so "every successful hit = crit" means threshold 2+
+      conditions.push({
+        text: "Attack step roll",
+        type: "attackStepRoll",
+        data: {
+          attackStep: { title: "Hit roll", key: "hitRoll" },
+          rollReq: { title: "Specific roll", key: "specificRoll" },
+          rollState: { title: "Unmodified", key: "unmodified" },
+          rollTarget: { title: "Or greater", key: "orGreater" },
+          rollValue: "2"
+        },
+        description: "Require a specific roll value in the attack sequence.",
+        preselected: false,
+        scope: ["global", "profile", "weapon"]
+      });
       const ability = makeUnitAbility(
         `${name}: All successful hits are Critical`,
-        `${name}: A successful Hit roll scores a Critical Hit (conditional)`,
+        `Hit roll of 2+ (unmodified) : critical hit${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical hit threshold", key: "critHitThreshold" }, absoluteValue: 2 } },
-        ["unit"]
+        {
+          text: "Override requirements",
+          type: "overrideReqs",
+          data: {
+            crit: true,
+            irrespective: false,
+            outcome: { title: "Hit", key: "hit" },
+            type: { title: "Always", key: "always" }
+          }
+        }
       );
       // These are always conditional (below half-strength, charged, etc.) — start inactive
       ability.aliasActive = false;
@@ -1190,11 +1468,10 @@ const ABILITY_PARSERS = [
     if (/improve the Ballistic Skill/i.test(desc)) {
       results.push(makeUnitAbility(
         `${name}: +1 BS`,
-        `${name}: Improve Ballistic Skill characteristic by 1`,
+        "+1 to hit roll (ranged only) (if attacker)",
         "attacker",
-        [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false }],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-        ["unit"]
+        [ucAttackTypeCondition("ranged")],
+        ucModifyRelativeEffect("Hit roll", "hitRoll", "Add", "add", 1)
       ));
     }
     if (/improve the Weapon Skill/i.test(desc) || (/improve the Ballistic Skill and Weapon Skill/i.test(desc))) {
@@ -1202,11 +1479,10 @@ const ABILITY_PARSERS = [
       if (/Weapon Skill/i.test(desc)) {
         results.push(makeUnitAbility(
           `${name}: +1 WS`,
-          `${name}: Improve Weapon Skill characteristic by 1`,
+          "+1 to hit roll (melee only) (if attacker)",
           "attacker",
-          [{ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false }],
-          { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-          ["unit"]
+          [ucAttackTypeCondition("melee")],
+          ucModifyRelativeEffect("Hit roll", "hitRoll", "Add", "add", 1)
         ));
       }
     }
@@ -1221,21 +1497,25 @@ const ABILITY_PARSERS = [
     if (!/attack[s]?\s+targets?\s+this/i.test(desc)) return null;
     if (!/subtract 1 from the Hit roll/i.test(desc)) return null;
     if (/Damaged/i.test(name)) return null; // Handled by parseDamaged
+    if (/^stealth$/i.test(name)) return null; // Handled by parseStealth
 
     const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
     const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
     const conditions = [];
-    if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+    if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+    if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
 
-    // Check for conditional (e.g. Strength > Toughness) — if present, description notes it but we can't model it directly
+    const qualifiers = [];
+    if (meleeOnly) qualifiers.push("melee only");
+    if (rangedOnly) qualifiers.push("ranged only");
+    const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
     return makeUnitAbility(
       `${name}: -1 to hit (defending${meleeOnly ? ', melee' : ''}${rangedOnly ? ', ranged' : ''})`,
-      `${name}: -1 to Hit roll (attacks targeting this unit${meleeOnly ? ', melee only' : ''}${rangedOnly ? ', ranged only' : ''})`,
+      `-1 to hit roll${qualStr} (if defender)`,
       "defender",
       conditions,
-      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-      ["unit"]
+      ucModifyRelativeEffect("Hit roll", "hitRoll", "Subtract", "subtract", 1)
     );
   },
 
@@ -1250,11 +1530,10 @@ const ABILITY_PARSERS = [
       // This is likely an aura/debuff — mark inactive
       const ability = makeUnitAbility(
         `${name}: -1 to hit (debuff)`,
-        `${name}: Subtract 1 from Hit roll (enemy debuff, toggle on target profile)`,
+        "-1 to hit roll (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Hit roll", key: "hitRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Hit roll", "hitRoll", "Subtract", "subtract", 1)
       );
       ability.aliasActive = false;
       return ability;
@@ -1269,11 +1548,10 @@ const ABILITY_PARSERS = [
     if (/subtract 1 from the Wound roll/i.test(desc) && !/attack targets/i.test(desc)) {
       const ability = makeUnitAbility(
         `${name}: -1 to wound (debuff)`,
-        `${name}: Subtract 1 from Wound roll (enemy debuff, toggle on target profile)`,
+        "-1 to wound roll (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Wound roll", "woundRoll", "Subtract", "subtract", 1)
       );
       ability.aliasActive = false;
       return ability;
@@ -1291,29 +1569,41 @@ const ABILITY_PARSERS = [
       const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
       const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
       const conditions = [];
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+      if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+
+      const qualifiers = [];
+      if (rangedOnly) qualifiers.push("ranged only");
+      if (meleeOnly) qualifiers.push("melee only");
+      const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
       const ability = makeUnitAbility(
         `${name}: +1 AP`,
-        `${name}: Improve AP by 1${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+        `Improve AP by 1${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "AP", key: "ap" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("AP", "ap", "Improve by", "improve", 1)
       );
       // Aura/conditional abilities start inactive
       if (/(?:friendly|other|within \d+"|Aura)/i.test(desc) || /Pain/i.test(name)) ability.aliasActive = false;
+      if (isStatBakeCandidate(desc)) {
+        ability._bakeable = true;
+        ability._bakeStat = "ap";
+        ability._bakeValue = 1;
+        ability._bakeScope = getStatBakeScope(desc);
+        const kw = getAuraKeywordFilter(desc);
+        if (kw) ability._bakeKeyword = kw;
+      }
       results.push(ability);
     }
     // Defensive: worsen AP by 1 (attacks targeting this/that unit)
     if (/worsen.*?Armour Penetration/i.test(desc) && /attack[s]?\s+targets?\s+(?:this|that)/i.test(desc)) {
       const defAbility = makeUnitAbility(
         `${name}: -1 AP (defending)`,
-        `${name}: Worsen AP by 1 (attacks targeting this unit)`,
+        "Degrade AP by 1 (if defender)",
         "defender",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "AP", key: "ap" }, operator: { title: "Subtract", key: "subtract" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("AP", "ap", "Degrade by", "degrade", 1)
       );
       // Aura targeting "that unit" (not "this unit") → inactive
       if (/targets?\s+that\s+unit/i.test(desc) || /(?:friendly|other|within \d+"|Aura)/i.test(desc)) defAbility.aliasActive = false;
@@ -1333,17 +1623,25 @@ const ABILITY_PARSERS = [
       const val = parseInt(mAtt[1], 10);
       const meleeOnly = /melee/i.test(desc);
       const conditions = [];
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+      if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+      const qualStr = meleeOnly ? " (melee only)" : "";
       const ability = makeUnitAbility(
         `${name}: +${val} Attacks`,
-        `${name}: +${val} to Attacks characteristic${meleeOnly ? ' (melee)' : ''}`,
+        `+${val} to attacks${qualStr} (if attacker)`,
         "attacker",
         conditions,
-        { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: String(val), applyToExtraAttacks: false } },
-        ["unit"]
+        { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: String(val), applyToExtraAttacks: false } }
       );
       // These are almost always conditional (Pain, once-per-battle, enhancement) — start inactive
       ability.aliasActive = false;
+      if (isStatBakeCandidate(desc)) {
+        ability._bakeable = true;
+        ability._bakeStat = "attacks";
+        ability._bakeValue = val;
+        ability._bakeScope = getStatBakeScope(desc);
+        const kw = getAuraKeywordFilter(desc);
+        if (kw) ability._bakeKeyword = kw;
+      }
       results.push(ability);
     }
     // Combined "Attacks and Strength" or just "Strength" from the same text (if not already caught by parseStrengthMod)
@@ -1354,16 +1652,24 @@ const ABILITY_PARSERS = [
         const val = parseInt(mVal[1], 10);
         const meleeOnly = /melee/i.test(desc);
         const conditions = [];
-        if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
+        if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+        const qualStr = meleeOnly ? " (melee only)" : "";
         const ability = makeUnitAbility(
           `${name}: +${val} Strength`,
-          `${name}: +${val} to Strength characteristic${meleeOnly ? ' (melee)' : ''}`,
+          `+${val} to strength${qualStr} (if attacker)`,
           "attacker",
           conditions,
-          { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
-          ["unit"]
+          ucModifyRelativeEffect("Strength", "strength", "Add", "add", val)
         );
         ability.aliasActive = false;
+        if (isStatBakeCandidate(desc)) {
+          ability._bakeable = true;
+          ability._bakeStat = "strength";
+          ability._bakeValue = val;
+          ability._bakeScope = getStatBakeScope(desc);
+          const kw = getAuraKeywordFilter(desc);
+          if (kw) ability._bakeKeyword = kw;
+        }
         results.push(ability);
       }
     }
@@ -1372,11 +1678,10 @@ const ABILITY_PARSERS = [
     if (/improve the Strength and Armour Penetration/i.test(desc)) {
       const ability = makeUnitAbility(
         `${name}: +1 Strength`,
-        `${name}: +1 to Strength characteristic (conditional)`,
+        "+1 to strength (if attacker)",
         "attacker",
         [],
-        { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Strength", key: "strength" }, operator: { title: "Add", key: "add" }, relativeValue: 1 } },
-        ["unit"]
+        ucModifyRelativeEffect("Strength", "strength", "Add", "add", 1)
       );
       ability.aliasActive = false;
       results.push(ability);
@@ -1397,18 +1702,31 @@ const ABILITY_PARSERS = [
     const meleeOnly = /melee attack/i.test(desc) && !/ranged attack/i.test(desc);
     const rangedOnly = /ranged attack/i.test(desc) && !/melee attack/i.test(desc);
     const conditions = [];
-    if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+    if (meleeOnly) conditions.push(ucAttackTypeCondition("melee"));
+    if (rangedOnly) conditions.push(ucAttackTypeCondition("ranged"));
+
+    const qualifiers = [];
+    if (rangedOnly) qualifiers.push("ranged only");
+    if (meleeOnly) qualifiers.push("melee only");
+    const qualStr = qualifiers.length ? ` (${qualifiers.join(", ")})` : "";
+
     const ability = makeUnitAbility(
       `${name}: +${val} Damage`,
-      `${name}: +${val} to Damage characteristic${meleeOnly ? ' (melee)' : ''}${rangedOnly ? ' (ranged)' : ''}`,
+      `+${val} to damage${qualStr} (if attacker)`,
       "attacker",
       conditions,
-      { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: val } },
-      ["unit"]
+      ucModifyRelativeEffect("Damage", "damage", "Add", "add", val)
     );
     // Almost always conditional (charge, aura, etc.) — start inactive
     ability.aliasActive = false;
+    if (isStatBakeCandidate(desc)) {
+      ability._bakeable = true;
+      ability._bakeStat = "damage";
+      ability._bakeValue = val;
+      ability._bakeScope = getStatBakeScope(desc);
+      const kw = getAuraKeywordFilter(desc);
+      if (kw) ability._bakeKeyword = kw;
+    }
     return ability;
   },
 
@@ -1899,9 +2217,41 @@ function parseWeaponKeywords(keywordsText) {
       abilities.push({
         aliases: [{ name: `Anti-${target} ${threshold}+`, type: "reserved" }],
         aliasActive: true,
-        conditions: [{ text: "Keyword", type: "keyword", data: { keyword: target }, description: `Target has ${target} keyword.`, preselected: false }],
-        description: `Critical wound on ${threshold}+ (vs ${target})`,
-        effect: { text: "Modify (absolute)", type: "modifyAbsolute", data: { application: { title: "Critical wound threshold", key: "critWound" }, absoluteValue: threshold } },
+        conditions: [
+          {
+            text: "Keywords (only)",
+            type: "keywordsOnly",
+            data: { keywords: [target] },
+            description: "Require one or more keywords.",
+            preselected: false,
+            scope: ["global", "profile", "weapon"]
+          },
+          {
+            text: "Attack step roll",
+            type: "attackStepRoll",
+            data: {
+              attackStep: { title: "Wound roll", key: "woundRoll" },
+              rollReq: { title: "Specific roll", key: "specificRoll" },
+              rollState: { title: "Unmodified", key: "unmodified" },
+              rollTarget: { title: "Or greater", key: "orGreater" },
+              rollValue: String(threshold)
+            },
+            description: "Require a specific roll value in the attack sequence.",
+            preselected: false,
+            scope: ["global", "profile", "weapon"]
+          }
+        ],
+        description: `Wound roll of ${threshold}+ (unmodified) : critical wound (${target} only)`,
+        effect: {
+          text: "Override requirements",
+          type: "overrideReqs",
+          data: {
+            crit: true,
+            irrespective: false,
+            outcome: { title: "Wound", key: "wound" },
+            type: { title: "Always", key: "always" }
+          }
+        },
         scope: ["weapon"],
         id: genUUID(),
         sharedWithAllUnits: false
@@ -2236,41 +2586,81 @@ function processSelectionUnit(selection) {
     }
   }
 
-  // ── Fix 3: Move weapon-targeted abilities to weapon-level ─────────────────
-  // Abilities tagged with _weaponTarget (e.g. Master of Magicks targeting "Bolt of Change")
-  // must be placed on matching weapon profiles, not as unit-scope profile abilities.
-  // Uses prefix matching: "Bolt of Change" matches "Bolt of Change - witchfire" etc.
-  const weaponTargeted = parsedAbilities.filter(a => a._weaponTarget);
-  if (weaponTargeted.length > 0) {
+  // ── Phase 4: Route weapon abilities to weapon-level as type: "reserved" ────
+  // Abilities tagged with _weaponAbility (has KEYWORD_ABILITY_MAP template) → reserved weapon abilities
+  // Abilities tagged with _weaponTarget only (dynamic keywords) → clone to weapon level as-is
+  // _weaponScope: "allRanged"/"allMelee"/"all" → attach to all matching weapons
+  const weaponRoutable = parsedAbilities.filter(a => a._weaponAbility || a._weaponTarget);
+  if (weaponRoutable.length > 0) {
     const toRemove = new Set();
-    for (const ability of weaponTargeted) {
-      const target = ability._weaponTarget.toLowerCase();
+    for (const ability of weaponRoutable) {
       let matched = false;
-      for (const mt of modelTypes) {
-        for (const w of mt.weapons) {
-          if (w.name.replace(/^[^a-zA-Z]+/, '').toLowerCase().startsWith(target)) {
-            // Clone as weapon-level ability: strip profileRole, set scope to weapon
-            const weaponAbility = {
-              id: genUUID(),
-              aliases: ability.aliases.map(a => ({ ...a })),
-              aliasActive: ability.aliasActive,
-              conditions: ability.conditions.filter(c => c.type !== "profileRole"),
-              description: ability.description,
-              effect: ability.effect,
-              scope: ["weapon"],
-              sharedWithAllUnits: false
-            };
-            w.abilities = w.abilities || [];
-            w.abilities.push(weaponAbility);
-            matched = true;
+      const template = ability._kwTemplate;
+
+      function attachToWeapon(w) {
+        // Dedup: skip if weapon already has this ability by name
+        const newName = template
+          ? template.aliases[0].name.toLowerCase()
+          : (ability.aliases[0]?.name || '').toLowerCase();
+        const existingNames = (w.abilities || []).map(a => (a.aliases[0]?.name || '').toLowerCase());
+        if (existingNames.includes(newName)) return false;
+
+        w.abilities = w.abilities || [];
+        if (template) {
+          // Phase 4: Create proper type: "reserved" weapon ability from template
+          w.abilities.push({
+            id: genUUID(),
+            aliases: template.aliases.map(a => ({ ...a })),
+            aliasActive: true,
+            conditions: [...template.conditions],
+            description: template.description,
+            effect: template.effect,
+            scope: [...template.scope],
+            sharedWithAllUnits: false
+          });
+        } else {
+          // Existing behavior: clone ability to weapon level (dynamic keywords like Anti-X)
+          w.abilities.push({
+            id: genUUID(),
+            aliases: ability.aliases.map(a => ({ ...a })),
+            aliasActive: ability.aliasActive,
+            conditions: ability.conditions.filter(c => c.type !== "profileRole"),
+            description: ability.description,
+            effect: ability.effect,
+            scope: ["weapon"],
+            sharedWithAllUnits: false
+          });
+        }
+        return true;
+      }
+
+      if (ability._weaponTarget) {
+        // Specific weapon target: prefix match on weapon name
+        const target = ability._weaponTarget.toLowerCase();
+        for (const mt of modelTypes) {
+          for (const w of mt.weapons) {
+            if (w.name.replace(/^[^a-zA-Z]+/, '').toLowerCase().startsWith(target)) {
+              if (attachToWeapon(w)) matched = true;
+            }
+          }
+        }
+      } else if (ability._weaponScope) {
+        // Scoped: all ranged, all melee, or all weapons
+        for (const mt of modelTypes) {
+          for (const w of mt.weapons) {
+            if (ability._weaponScope === "allRanged" && w.type !== "Ranged") continue;
+            if (ability._weaponScope === "allMelee" && w.type !== "Melee") continue;
+            if (attachToWeapon(w)) matched = true;
           }
         }
       }
-      if (matched) {
-        toRemove.add(ability);
-      }
+
+      if (matched) toRemove.add(ability);
       // Clean up metadata
       delete ability._weaponTarget;
+      delete ability._weaponAbility;
+      delete ability._kwTemplate;
+      delete ability._weaponScope;
     }
     // Remove matched abilities from profile-level
     if (toRemove.size > 0) {
@@ -2278,6 +2668,73 @@ function processSelectionUnit(selection) {
       parsedAbilities.length = 0;
       parsedAbilities.push(...remaining);
     }
+  }
+
+  // ── Stat Bakes: Self-applying always-on stat mods → bake into weapon values ──
+  // Only bake abilities that are NOT from enhancements (BSData already bakes those)
+  for (const ability of parsedAbilities) {
+    if (!ability._bakeable) continue;
+    // Skip enhancement stat mods (already baked by BSData)
+    if (/ENHANCEMENT STAT MOD/i.test(ability.description || '')) {
+      delete ability._bakeable; delete ability._bakeStat;
+      delete ability._bakeValue; delete ability._bakeScope;
+      delete ability._bakeKeyword;
+      continue;
+    }
+    // Verify aura keyword filter: bearer's unit must have the matching keyword
+    if (ability._bakeKeyword) {
+      const catNames = (selection.categories || []).map(c => (c.name || '').toUpperCase());
+      const filterWords = ability._bakeKeyword.split(/\s+/);
+      const allMatch = filterWords.every(word => catNames.some(cat => cat.includes(word)));
+      if (!allMatch) {
+        delete ability._bakeable; delete ability._bakeStat;
+        delete ability._bakeValue; delete ability._bakeScope;
+        delete ability._bakeKeyword;
+        continue;
+      }
+    }
+
+    let baked = false;
+    for (const mt of modelTypes) {
+      for (const w of mt.weapons) {
+        const isRanged = w.type === "Ranged";
+        const isMelee = w.type === "Melee";
+        if (ability._bakeScope === "ranged" && !isRanged) continue;
+        if (ability._bakeScope === "melee" && !isMelee) continue;
+
+        if (ability._bakeStat === "strength" && typeof w.strength === "number") {
+          w.strength += ability._bakeValue;
+          baked = true;
+        } else if (ability._bakeStat === "ap" && typeof w.ap === "number") {
+          w.ap -= ability._bakeValue; // AP improves by becoming more negative
+          baked = true;
+        } else if (ability._bakeStat === "attacks" && typeof w.attacks === "number") {
+          w.attacks += ability._bakeValue;
+          baked = true;
+        } else if (ability._bakeStat === "damage" && typeof w.damage === "number") {
+          w.damage += ability._bakeValue;
+          baked = true;
+        }
+      }
+    }
+
+    if (baked) {
+      // Convert ability to annotation
+      const scopeStr = ability._bakeScope === "all" ? "" : ` (${ability._bakeScope})`;
+      const statStr = ability._bakeStat === "ap" ? "AP" : ability._bakeStat.charAt(0).toUpperCase() + ability._bakeStat.slice(1);
+      const sourceName = (ability.aliases[0].name || "").split(':')[0].trim();
+      ability.aliases = [{ name: `\u26A0 Pre-baked: +${ability._bakeValue} ${statStr}${scopeStr} from ${sourceName}`, type: "custom" }];
+      ability.aliasActive = false;
+      ability.conditions = [ability.conditions[0]]; // Keep only profileRole condition
+      ability.effect = { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Wound roll", key: "woundRoll" }, operator: { title: "Add", key: "add" }, relativeValue: 0 } };
+    }
+
+    // Clean up metadata
+    delete ability._bakeable;
+    delete ability._bakeStat;
+    delete ability._bakeValue;
+    delete ability._bakeScope;
+    delete ability._bakeKeyword;
   }
 
   const unitId = genUUID();
