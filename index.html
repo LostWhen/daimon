@@ -88,7 +88,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.76.0</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.77.0</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -100,7 +100,7 @@
 
 <div id="footer">
   <p class="compat">
-    Daimon v0.76.0 &middot;
+    Daimon v0.77.0 &middot;
     Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
     <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
   </p>
@@ -425,10 +425,10 @@ const KEYWORD_ABILITY_MAP = {
     scope: ["weapon"]
   },
   "blast": {
-    description: "Blast (+1 attack per 5 models in target unit)",
+    description: "Blast",
     aliases: [{ name: "Blast", type: "reserved" }],
     conditions: [],
-    effect: { text: "Special", type: "special", data: {} },
+    effect: { text: "Special", type: "special", data: { option: { title: "Blast", key: "blast" } } },
     scope: ["weapon"]
   },
   "hazardous": {
@@ -481,10 +481,10 @@ const KEYWORD_ABILITY_MAP = {
     scope: ["weapon"]
   },
   "extra attacks": {
-    description: "Extra Attacks (attacks with this weapon are made in addition to other weapons)",
+    description: "Extra attacks",
     aliases: [{ name: "Extra attacks", type: "reserved" }],
     conditions: [],
-    effect: { text: "Special", type: "special", data: {} },
+    effect: { text: "Special", type: "special", data: { option: { title: "Extra attacks", key: "extraAttacks" } } },
     scope: ["weapon"]
   },
   "pistol": {
@@ -1156,9 +1156,10 @@ const ABILITY_PARSERS = [
     }
 
     // Phase 4: Detect self-applying weapon scope (allRanged/allMelee/all)
-    // Only for non-select-one, non-weapon-targeted abilities that grant keywords to own weapons
+    // For non-weapon-targeted abilities that grant keywords to own weapons
+    // Also runs for select-one so scope detection is available for marker post-processing
     let weaponScope = null;
-    if (!selectOne && !weaponTarget) {
+    if (!weaponTarget) {
       const selfApplying =
         /equipped\s+by\s+models?\s+in\s+(?:this|that)\s+(?:unit|model's\s+unit)/i.test(desc) ||
         /equipped\s+by\s+this\s+model/i.test(desc) ||
@@ -1172,30 +1173,34 @@ const ABILITY_PARSERS = [
       }
     }
 
-    // Phase 4: Select-one → single annotation instead of multiple broken custom abilities
+    // Select-one → emit marker for post-processing weapon variant creation
     if (selectOne) {
-      const kwNames = [];
+      // Filter brackets to valid ability keywords only
+      const validOptions = [];
       for (const kw of brackets) {
         const kwLower = kw.toLowerCase().replace(/\s+/g, ' ');
-        const t = KEYWORD_ABILITY_MAP[kwLower];
-        if (t) { kwNames.push(t.aliases[0].name); continue; }
-        const sh = kwLower.match(/sustained hits\s+(\w+)/);
-        if (sh) { kwNames.push('Sustained hits ' + sh[1].replace(/^d/i, 'D')); continue; }
-        // Skip non-ability bracket text like [excluding VEHICLES]
-        if (/^(?:anti|melta|rapid fire|lethal|ignores|precision|devastating)/i.test(kw)) kwNames.push(kw);
+        if (KEYWORD_ABILITY_MAP[kwLower]) { validOptions.push(kw); continue; }
+        if (/sustained hits\s+\w+/.test(kwLower)) { validOptions.push(kw); continue; }
+        if (/rapid fire\s+\w+/.test(kwLower)) { validOptions.push(kw); continue; }
+        if (/anti[- ]\w+\s+\d+\+/.test(kwLower)) { validOptions.push(kw); continue; }
+        if (/melta\s+\d+/.test(kwLower)) { validOptions.push(kw); continue; }
+        if (/^(?:ignores|precision|devastating)/i.test(kw)) validOptions.push(kw);
       }
-      if (kwNames.length === 0) return null;
-      const weaponNote = weaponRef ? ` for ${weaponRef}` : '';
-      const annotation = makeUnitAbility(
-        `\u26A0 Select ONE${weaponNote}: ${kwNames.join(' / ')} \u2014 add via Preset abilities`,
-        `${name}: Select one of: ${kwNames.join(', ')}. Add the chosen ability via the Preset abilities button in UC.`,
-        "attacker",
-        [],
-        { text: "Special", type: "special", data: {} },
-        ["unit"]
-      );
-      annotation.aliasActive = false;
-      return [annotation];
+      if (validOptions.length === 0) return null;
+      // Strip trailing parenthetical from ability name (e.g. "Master of Magicks (Psychic)" → "Master of Magicks")
+      const cleanName = name.replace(/\s*\([^)]*\)\s*$/, '').trim();
+      const marker = {
+        _isSelectOneMarker: true,
+        _selectOneName: cleanName,
+        _selectOneOptions: validOptions,
+        _weaponTarget: weaponRef || null,
+        _weaponScope: weaponScope || null
+      };
+      // Detect psychic keyword filter: "with the [Psychic] ability"
+      if (/with\s+the\s+\[Psychic\]\s+ability/i.test(desc)) {
+        marker._selectOneKeywordFilter = "psychic";
+      }
+      return [marker];
     }
 
     // Non-select-one: process each keyword
@@ -1961,6 +1966,14 @@ function extractParsedAbilities(selection) {
       abilities.push(abilityOrMeta);
       return;
     }
+    // Pass through select-one markers with dedup by ability name
+    if (abilityOrMeta._isSelectOneMarker) {
+      const key = `_selectOne:${abilityOrMeta._selectOneName}`;
+      if (seenNames.has(key)) return;
+      seenNames.add(key);
+      abilities.push(abilityOrMeta);
+      return;
+    }
     const key = abilityOrMeta.aliases[0].name;
     if (seenNames.has(key)) return;
     seenNames.add(key);
@@ -2607,7 +2620,7 @@ function processSelectionUnit(selection) {
   // Abilities tagged with _weaponAbility (has KEYWORD_ABILITY_MAP template) → reserved weapon abilities
   // Abilities tagged with _weaponTarget only (dynamic keywords) → clone to weapon level as-is
   // _weaponScope: "allRanged"/"allMelee"/"all" → attach to all matching weapons
-  const weaponRoutable = parsedAbilities.filter(a => a._weaponAbility || a._weaponTarget);
+  const weaponRoutable = parsedAbilities.filter(a => (a._weaponAbility || a._weaponTarget) && !a._isSelectOneMarker);
   if (weaponRoutable.length > 0) {
     const toRemove = new Set();
     for (const ability of weaponRoutable) {
@@ -2684,6 +2697,178 @@ function processSelectionUnit(selection) {
       const remaining = parsedAbilities.filter(a => !toRemove.has(a));
       parsedAbilities.length = 0;
       parsedAbilities.push(...remaining);
+    }
+  }
+
+  // ── Select-one weapon variants: duplicate weapons with baked-in keyword ──────
+  // Markers emitted by parseBracketKeywordsInText for "select one of" abilities.
+  // For each option, create a copy of the target weapon(s) with the chosen keyword baked in.
+  const selectOneMarkers = parsedAbilities.filter(a => a._isSelectOneMarker);
+  if (selectOneMarkers.length > 0) {
+    // Remove markers from parsedAbilities
+    const remaining = parsedAbilities.filter(a => !a._isSelectOneMarker);
+    parsedAbilities.length = 0;
+    parsedAbilities.push(...remaining);
+
+    // Build a weapon-level ability from a raw bracket keyword (e.g. "IGNORES COVER", "SUSTAINED HITS D3")
+    function buildWeaponAbilityFromKeyword(rawKw) {
+      const kwLower = rawKw.toLowerCase().replace(/\s+/g, ' ');
+      // Direct KEYWORD_ABILITY_MAP match
+      if (KEYWORD_ABILITY_MAP[kwLower]) {
+        const t = KEYWORD_ABILITY_MAP[kwLower];
+        return {
+          ability: {
+            aliases: t.aliases.map(a => ({ ...a })),
+            aliasActive: true, conditions: [...t.conditions], description: t.description,
+            effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+          },
+          displayName: t.aliases[0].name
+        };
+      }
+      // Anti-X pattern
+      const antiMatch = kwLower.match(/anti[- ](\w+)\s+(\d+)\+/);
+      if (antiMatch) {
+        const target = antiMatch[1].toUpperCase();
+        const threshold = parseInt(antiMatch[2], 10);
+        return {
+          ability: {
+            aliases: [{ name: `Anti-${target} ${threshold}+`, type: "reserved" }],
+            aliasActive: true,
+            conditions: [
+              { text: "Keywords (only)", type: "keywordsOnly", data: { keywords: [target] }, description: "Require one or more keywords.", preselected: false, scope: ["global", "profile", "weapon"] },
+              { text: "Attack step roll", type: "attackStepRoll", data: { attackStep: { title: "Wound roll", key: "woundRoll" }, rollReq: { title: "Specific roll", key: "specificRoll" }, rollState: { title: "Unmodified", key: "unmodified" }, rollTarget: { title: "Or greater", key: "orGreater" }, rollValue: String(threshold) }, description: "Require a specific roll value in the attack sequence.", preselected: false, scope: ["global", "profile", "weapon"] }
+            ],
+            description: `Wound roll of ${threshold}+ (unmodified) : critical wound (${target} only)`,
+            effect: { text: "Override requirements", type: "overrideReqs", data: { crit: true, irrespective: false, outcome: { title: "Wound", key: "wound" }, type: { title: "Always", key: "always" } } },
+            scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
+          },
+          displayName: `Anti-${target} ${threshold}+`
+        };
+      }
+      // Melta X
+      const meltaMatch = kwLower.match(/melta\s+(\d+)/);
+      if (meltaMatch) {
+        const mVal = parseInt(meltaMatch[1], 10);
+        return {
+          ability: {
+            aliases: [{ name: `Melta ${mVal}`, type: "reserved" }], aliasActive: true,
+            conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+            description: `+${mVal} to damage (within half range)`,
+            effect: { text: "Modify (relative)", type: "modifyRelative", data: { application: { title: "Damage", key: "damage" }, operator: { title: "Add", key: "add" }, relativeValue: mVal } },
+            scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
+          },
+          displayName: `Melta ${mVal}`
+        };
+      }
+      // Sustained hits (variable)
+      const sustainedMatch = kwLower.match(/sustained hits\s+(\w+)/);
+      if (sustainedMatch) {
+        const rawVal = sustainedMatch[1];
+        const displayVal = rawVal.replace(/^d/i, 'D');
+        const presetKey = `sustained hits ${rawVal}`;
+        if (KEYWORD_ABILITY_MAP[presetKey]) {
+          const t = KEYWORD_ABILITY_MAP[presetKey];
+          return {
+            ability: {
+              aliases: t.aliases.map(a => ({ ...a })), aliasActive: true, conditions: [...t.conditions],
+              description: t.description, effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+            },
+            displayName: t.aliases[0].name
+          };
+        }
+        return {
+          ability: {
+            aliases: [{ name: `Sustained hits ${displayVal}`, type: "reserved" }], aliasActive: true,
+            conditions: [{ text: "Critical hit/wound", type: "crit", data: { crit: { title: "Critical hit", key: "hitRoll" } }, description: 'Require a hit or wound to be "critical".', preselected: false }],
+            description: `Critical hit : ${displayVal} extra hits`,
+            effect: makeSustainedEffect(displayVal), scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
+          },
+          displayName: `Sustained hits ${displayVal}`
+        };
+      }
+      // Rapid fire (variable)
+      const rapidMatch = kwLower.match(/rapid fire\s+(\w+)/);
+      if (rapidMatch) {
+        const rawVal = rapidMatch[1];
+        const displayVal = rawVal.replace(/^d/i, 'D');
+        const presetKey = `rapid fire ${rawVal}`;
+        if (KEYWORD_ABILITY_MAP[presetKey]) {
+          const t = KEYWORD_ABILITY_MAP[presetKey];
+          return {
+            ability: {
+              aliases: t.aliases.map(a => ({ ...a })), aliasActive: true, conditions: [...t.conditions],
+              description: t.description, effect: t.effect, scope: [...t.scope], id: genUUID(), sharedWithAllUnits: false
+            },
+            displayName: t.aliases[0].name
+          };
+        }
+        return {
+          ability: {
+            aliases: [{ name: `Rapid fire ${displayVal}`, type: "reserved" }], aliasActive: true,
+            conditions: [{ text: "Range", type: "range", data: { range: { title: "Within half range", key: "withinHalfRange" } }, description: "Check attack range.", preselected: false }],
+            description: `Increase attacks by ${displayVal} (within half range)`,
+            effect: { text: "Increase weapon attacks", type: "increaseWeaponAttacks", data: { increaseWeaponAttacksValue: displayVal, applyToExtraAttacks: false } },
+            scope: ["weapon"], id: genUUID(), sharedWithAllUnits: false
+          },
+          displayName: `Rapid fire ${displayVal}`
+        };
+      }
+      return null; // Unrecognized keyword
+    }
+
+    for (const marker of selectOneMarkers) {
+      // Find matching weapons
+      const matchingWeapons = [];
+      for (const mt of modelTypes) {
+        for (const w of mt.weapons) {
+          if (marker._weaponTarget) {
+            const target = marker._weaponTarget.toLowerCase();
+            if (w.name.replace(/^[^a-zA-Z]+/, '').toLowerCase().startsWith(target)) {
+              matchingWeapons.push({ weapon: w, modelType: mt });
+            }
+          } else if (marker._weaponScope) {
+            if (marker._weaponScope === "allRanged" && w.type !== "Ranged") continue;
+            if (marker._weaponScope === "allMelee" && w.type !== "Melee") continue;
+            // Psychic keyword filter: only weapons that already have Psychic ability
+            if (marker._selectOneKeywordFilter === "psychic") {
+              const hasPsychic = (w.abilities || []).some(a =>
+                (a.aliases || []).some(al => al.name.toLowerCase() === "psychic")
+              );
+              if (!hasPsychic) continue;
+            }
+            matchingWeapons.push({ weapon: w, modelType: mt });
+          }
+        }
+      }
+
+      // Create weapon variants
+      for (const { weapon, modelType } of matchingWeapons) {
+        for (const optionKw of marker._selectOneOptions) {
+          const built = buildWeaponAbilityFromKeyword(optionKw);
+          if (!built) continue;
+
+          // Deep copy the base weapon
+          const variant = JSON.parse(JSON.stringify(weapon));
+          variant.id = genUUID();
+          variant.name = `${weapon.name} (${marker._selectOneName}: ${built.displayName})`;
+          variant.nameUnique = variant.name;
+
+          // Append the keyword ability
+          variant.abilities = variant.abilities || [];
+          // Check ability cap (max 6 recommended by UC)
+          if (variant.abilities.length >= 6) {
+            console.warn(`[Daimon] Warning: weapon "${variant.name}" exceeds 6 abilities (${variant.abilities.length + 1})`);
+          }
+          // Ensure new ability gets a fresh ID (deep copy already handled existing ones)
+          built.ability.id = genUUID();
+          variant.abilities.push(built.ability);
+
+          // Insert variant into the same model type's weapons array
+          modelType.weapons.push(variant);
+          // Track in selected weapons
+          (variant.type === "Melee" ? allWeaponsMelee : allWeaponsRanged).push(variant.id);
+        }
+      }
     }
   }
 
