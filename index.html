@@ -88,7 +88,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.75.2</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.76.0</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -100,7 +100,7 @@
 
 <div id="footer">
   <p class="compat">
-    Daimon v0.75.2 &middot;
+    Daimon v0.76.0 &middot;
     Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
     <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
   </p>
@@ -273,6 +273,67 @@ function makeRerollEffect(rollKey, rollTitle, resultType) {
       resultToReRoll: { title: "All possible failures", key: "allPossibleFailures" },
       valueRange: [], valueSingle: null
     }
+  };
+}
+
+// Build a weapon-level reroll description string (no role suffix)
+// rollTitle for hit/wound includes " roll" ("Hit roll", "Wound roll") but
+// damage is just "Damage" — normalize so pluralization works correctly.
+function buildWeaponRerollDescription(marker) {
+  const rollName = marker.rollTitle.toLowerCase();
+  // "hit roll" / "wound roll" already contain "roll"; damage needs it appended
+  const rollNameFull = marker.rollKey === "damage" ? "damage roll" : rollName;
+  if (marker.limitType === "single") {
+    return `Re-roll one possible failed ${rollNameFull}`;
+  } else if (marker.resultType === "ones") {
+    // "Re-roll all hit roll results of 1" / "Re-roll all damage results of 1"
+    return `Re-roll all ${rollName} results of 1`;
+  } else if (marker.resultType === "allFailed") {
+    return `Re-roll all possible failed ${rollNameFull}s`;
+  }
+}
+
+// Create a weapon-level reroll ability from a _isWeaponReroll marker object
+function makeWeaponReroll(marker) {
+  let resultToReRoll, valueSingle, valueRange, limit, scope;
+
+  if (marker.resultType === "ones") {
+    resultToReRoll = { title: "Single", key: "single" };
+    valueSingle = 1;
+    valueRange = [];
+  } else if (marker.resultType === "allFailed") {
+    resultToReRoll = { title: "All possible failures", key: "allPossibleFailures" };
+    valueSingle = null;
+    valueRange = [];
+  }
+
+  if (marker.limitType === "single") {
+    limit = { title: "Single", key: "single" };
+    scope = ["weapon"];
+  } else {
+    limit = { title: "None", key: "none" };
+    scope = ["global", "weapon"];
+  }
+
+  return {
+    description: buildWeaponRerollDescription(marker),
+    scope,
+    conditions: [],
+    aliases: [{ name: `${marker.contextName}: ${buildWeaponRerollDescription(marker)}`, type: "custom" }],
+    effect: {
+      text: "Re-roll",
+      type: "reRoll",
+      data: {
+        application: { title: marker.rollTitle, key: marker.rollKey },
+        limit,
+        resultToReRoll,
+        valueRange,
+        valueSingle
+      }
+    },
+    aliasActive: marker.startInactive ? false : true,
+    sharedWithAllUnits: false,
+    id: genUUID()
   };
 }
 
@@ -824,30 +885,18 @@ const ABILITY_PARSERS = [
   // ── Re-roll hit rolls of 1 ─────────────────────────────────────────────────
   function parseRerollHit1(name, desc) {
     if (/re-roll a Hit roll of 1/i.test(desc) && !/re-roll the Hit roll instead/i.test(desc)) {
-      // Simple reroll 1s, no conditional upgrade
       const rangedOnly = /ranged attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc);
-      const conditions = [];
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-
-      // Check for conditional target (MONSTER/VEHICLE)
-      const targetMatch = desc.match(/targets?\s+(?:a\s+)?(MONSTER|VEHICLE|MONSTER or VEHICLE|VEHICLE or MONSTER)\s+unit/i);
-      if (targetMatch) {
-        const kws = targetMatch[1].toUpperCase().split(/\s+or\s+/i);
-        for (const kw of kws) {
-          conditions.push({ text: "Keyword", type: "keyword", data: { keyword: kw.trim() }, description: `Target has ${kw.trim()} keyword.`, preselected: false });
-        }
-      }
-
-      return makeUnitAbility(
-        `${name}: Re-roll hit 1s`,
-        `${name}: Re-roll hit rolls of 1${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
-        "attacker",
-        conditions,
-        makeRerollEffect("hitRoll", "Hit roll", "ones"),
-        ["unit"]
-      );
+      return {
+        _isWeaponReroll: true,
+        contextName: name,
+        rollKey: "hitRoll",
+        rollTitle: "Hit roll",
+        resultType: "ones",
+        limitType: "none",
+        attackTypeFilter: rangedOnly ? "Ranged" : meleeOnly ? "Melee" : null,
+        startInactive: false
+      };
     }
     return null;
   },
@@ -857,33 +906,23 @@ const ABILITY_PARSERS = [
     if (!/re-roll a Hit roll of 1/i.test(desc)) return null;
     if (!/re-roll the Hit roll instead/i.test(desc)) return null;
 
-    // This is the "reroll 1s baseline, full reroll conditionally" pattern
-    // e.g. Dat's Our Loot!, Stand Vigil (hit version)
     const rangedOnly = /ranged attack/i.test(desc);
-    const conditions = [];
-    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+    const attackTypeFilter = rangedOnly ? "Ranged" : null;
 
-    // Base ability: reroll 1s (always on)
-    const base = makeUnitAbility(
-      `${name}: Re-roll hit 1s`,
-      `${name}: Re-roll hit rolls of 1${rangedOnly ? ' (ranged)' : ''}`,
-      "attacker",
-      conditions,
-      makeRerollEffect("hitRoll", "Hit roll", "ones"),
-      ["unit"]
-    );
-
-    // Upgraded ability: full re-roll (conditional — user toggles in UC)
-    const upgraded = makeUnitAbility(
-      `${name}: Re-roll all hits (conditional)`,
-      `${name}: Re-roll hit rolls (if condition met)`,
-      "attacker",
-      conditions,
-      makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
-      ["unit"]
-    );
-    // Return both; upgraded starts deactivated
-    upgraded.aliasActive = false;
+    // Base: reroll 1s (always active)
+    const base = {
+      _isWeaponReroll: true, contextName: name,
+      rollKey: "hitRoll", rollTitle: "Hit roll",
+      resultType: "ones", limitType: "none",
+      attackTypeFilter, startInactive: false
+    };
+    // Upgrade: full reroll (inactive by default, user toggles)
+    const upgraded = {
+      _isWeaponReroll: true, contextName: name,
+      rollKey: "hitRoll", rollTitle: "Hit roll",
+      resultType: "allFailed", limitType: "none",
+      attackTypeFilter, startInactive: true
+    };
     return [base, upgraded];
   },
 
@@ -892,18 +931,13 @@ const ABILITY_PARSERS = [
     if (/re-roll a Wound roll of 1/i.test(desc) && !/re-roll the Wound roll instead/i.test(desc)) {
       const rangedOnly = /ranged attack/i.test(desc);
       const meleeOnly = /melee attack/i.test(desc);
-      const conditions = [];
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      if (meleeOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Melee", key: "melee" } }, description: "Attack type is Melee.", preselected: false });
-
-      return makeUnitAbility(
-        `${name}: Re-roll wound 1s`,
-        `${name}: Re-roll wound rolls of 1${rangedOnly ? ' (ranged)' : ''}${meleeOnly ? ' (melee)' : ''}`,
-        "attacker",
-        conditions,
-        makeRerollEffect("woundRoll", "Wound roll", "ones"),
-        ["unit"]
-      );
+      return {
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "woundRoll", rollTitle: "Wound roll",
+        resultType: "ones", limitType: "none",
+        attackTypeFilter: rangedOnly ? "Ranged" : meleeOnly ? "Melee" : null,
+        startInactive: false
+      };
     }
     return null;
   },
@@ -914,26 +948,20 @@ const ABILITY_PARSERS = [
     if (!/re-roll the Wound roll instead/i.test(desc)) return null;
 
     const rangedOnly = /ranged attack/i.test(desc);
-    const conditions = [];
-    if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
+    const attackTypeFilter = rangedOnly ? "Ranged" : null;
 
-    const base = makeUnitAbility(
-      `${name}: Re-roll wound 1s`,
-      `${name}: Re-roll wound rolls of 1`,
-      "attacker",
-      conditions,
-      makeRerollEffect("woundRoll", "Wound roll", "ones"),
-      ["unit"]
-    );
-    const upgraded = makeUnitAbility(
-      `${name}: Re-roll all wounds (conditional)`,
-      `${name}: Re-roll wound rolls (if condition met)`,
-      "attacker",
-      conditions,
-      makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
-      ["unit"]
-    );
-    upgraded.aliasActive = false;
+    const base = {
+      _isWeaponReroll: true, contextName: name,
+      rollKey: "woundRoll", rollTitle: "Wound roll",
+      resultType: "ones", limitType: "none",
+      attackTypeFilter, startInactive: false
+    };
+    const upgraded = {
+      _isWeaponReroll: true, contextName: name,
+      rollKey: "woundRoll", rollTitle: "Wound roll",
+      resultType: "allFailed", limitType: "none",
+      attackTypeFilter, startInactive: true
+    };
     return [base, upgraded];
   },
 
@@ -1193,19 +1221,15 @@ const ABILITY_PARSERS = [
 
   // ── Re-roll all hit rolls ──────────────────────────────────────────────────
   function parseFullRerollHit(name, desc) {
-    // "you can re-roll the Hit roll" without "of 1" qualifier
     if (/re-roll (?:the )?(?:all )?Hit rolls?(?!\s+of\s+1)/i.test(desc) && !/re-roll a Hit roll of 1/i.test(desc)) {
-      const conditions = [];
       const rangedOnly = /ranged attack/i.test(desc);
-      if (rangedOnly) conditions.push({ text: "Attack type", type: "attackType", data: { attackType: { title: "Ranged", key: "ranged" } }, description: "Attack type is Ranged.", preselected: false });
-      return makeUnitAbility(
-        `${name}: Re-roll hits`,
-        `${name}: Re-roll hit rolls`,
-        "attacker",
-        conditions,
-        makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
-        ["unit"]
-      );
+      return {
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "hitRoll", rollTitle: "Hit roll",
+        resultType: "allFailed", limitType: "none",
+        attackTypeFilter: rangedOnly ? "Ranged" : null,
+        startInactive: false
+      };
     }
     return null;
   },
@@ -1213,14 +1237,13 @@ const ABILITY_PARSERS = [
   // ── Re-roll all wound rolls ────────────────────────────────────────────────
   function parseFullRerollWound(name, desc) {
     if (/re-roll (?:the )?(?:all )?Wound rolls?(?!\s+of\s+1)/i.test(desc) && !/re-roll a Wound roll of 1/i.test(desc)) {
-      return makeUnitAbility(
-        `${name}: Re-roll wounds`,
-        `${name}: Re-roll wound rolls`,
-        "attacker",
-        [],
-        makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
-        ["unit"]
-      );
+      return {
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "woundRoll", rollTitle: "Wound roll",
+        resultType: "allFailed", limitType: "none",
+        attackTypeFilter: null,
+        startInactive: false
+      };
     }
     return null;
   },
@@ -1397,26 +1420,21 @@ const ABILITY_PARSERS = [
   // ── Re-roll one Hit/Wound roll (e.g. Crystal Matrix) ──────────────────────
   function parseRerollOne(name, desc) {
     const results = [];
-    // "re-roll one Hit roll" — functionally same as re-roll a hit roll (single model)
     if (/re-roll one Hit roll/i.test(desc)) {
-      results.push(makeUnitAbility(
-        `${name}: Re-roll one hit`,
-        `${name}: Re-roll one Hit roll`,
-        "attacker",
-        [],
-        makeRerollEffect("hitRoll", "Hit roll", "allFailed"),
-        ["unit"]
-      ));
+      results.push({
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "hitRoll", rollTitle: "Hit roll",
+        resultType: "allFailed", limitType: "single",
+        attackTypeFilter: null, startInactive: false
+      });
     }
     if (/re-roll one Wound roll/i.test(desc)) {
-      results.push(makeUnitAbility(
-        `${name}: Re-roll one wound`,
-        `${name}: Re-roll one Wound roll`,
-        "attacker",
-        [],
-        makeRerollEffect("woundRoll", "Wound roll", "allFailed"),
-        ["unit"]
-      ));
+      results.push({
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "woundRoll", rollTitle: "Wound roll",
+        resultType: "allFailed", limitType: "single",
+        attackTypeFilter: null, startInactive: false
+      });
     }
     return results.length ? results : null;
   },
@@ -1424,39 +1442,30 @@ const ABILITY_PARSERS = [
   // ── Re-roll Damage rolls (e.g. Structural Collapse) ───────────────────────
   function parseRerollDamage(name, desc) {
     const results = [];
-    // "re-roll a Damage roll of 1" + optional conditional "re-roll the Damage roll instead"
     if (/re-roll (?:a )?Damage roll of 1/i.test(desc)) {
-      results.push(makeUnitAbility(
-        `${name}: Re-roll damage 1s`,
-        `${name}: Re-roll Damage rolls of 1`,
-        "attacker",
-        [],
-        makeRerollEffect("damage", "Damage", "ones"),
-        ["unit"]
-      ));
+      results.push({
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "damage", rollTitle: "Damage",
+        resultType: "ones", limitType: "none",
+        attackTypeFilter: null, startInactive: false
+      });
       if (/re-roll the Damage roll instead/i.test(desc)) {
-        const upgraded = makeUnitAbility(
-          `${name}: Re-roll all damage (conditional)`,
-          `${name}: Re-roll the Damage roll (conditional upgrade)`,
-          "attacker",
-          [],
-          makeRerollEffect("damage", "Damage", "allFailed"),
-          ["unit"]
-        );
-        upgraded.aliasActive = false;
-        results.push(upgraded);
+        results.push({
+          _isWeaponReroll: true, contextName: name,
+          rollKey: "damage", rollTitle: "Damage",
+          resultType: "allFailed", limitType: "none",
+          attackTypeFilter: null, startInactive: true
+        });
       }
     }
     // "re-roll the Damage roll" (without "of 1") — full reroll
     else if (/re-roll the Damage roll/i.test(desc) || /re-roll the damage roll/i.test(desc)) {
-      results.push(makeUnitAbility(
-        `${name}: Re-roll damage`,
-        `${name}: Re-roll the Damage roll`,
-        "attacker",
-        [],
-        makeRerollEffect("damage", "Damage", "allFailed"),
-        ["unit"]
-      ));
+      results.push({
+        _isWeaponReroll: true, contextName: name,
+        rollKey: "damage", rollTitle: "Damage",
+        resultType: "allFailed", limitType: "none",
+        attackTypeFilter: null, startInactive: false
+      });
     }
     return results.length ? results : null;
   },
@@ -1942,6 +1951,14 @@ function extractParsedAbilities(selection) {
       if (textInvuln === null || abilityOrMeta._invuln < textInvuln) {
         textInvuln = abilityOrMeta._invuln;
       }
+      return;
+    }
+    // Pass through weapon reroll markers with dedup by signature
+    if (abilityOrMeta._isWeaponReroll) {
+      const key = `_reroll:${abilityOrMeta.rollKey}|${abilityOrMeta.resultType}|${abilityOrMeta.attackTypeFilter}|${abilityOrMeta.limitType}|${abilityOrMeta.startInactive}`;
+      if (seenNames.has(key)) return;
+      seenNames.add(key);
+      abilities.push(abilityOrMeta);
       return;
     }
     const key = abilityOrMeta.aliases[0].name;
@@ -2735,6 +2752,30 @@ function processSelectionUnit(selection) {
     delete ability._bakeValue;
     delete ability._bakeScope;
     delete ability._bakeKeyword;
+  }
+
+  // ── Pass 2: Relocate reroll abilities from profile-level to weapon-level ──
+  // UC only applies rerolls when they are weapon abilities, not profile abilities.
+  // Separate reroll markers from regular abilities and inject into matching weapons.
+  const rerollMarkers = parsedAbilities.filter(a => a._isWeaponReroll);
+  if (rerollMarkers.length > 0) {
+    // Remove markers from parsedAbilities
+    const remaining = parsedAbilities.filter(a => !a._isWeaponReroll);
+    parsedAbilities.length = 0;
+    parsedAbilities.push(...remaining);
+
+    // Inject rerolls into matching weapons on all model types
+    for (const marker of rerollMarkers) {
+      for (const mt of modelTypes) {
+        for (const weapon of mt.weapons) {
+          if (marker.attackTypeFilter) {
+            if (weapon.type !== marker.attackTypeFilter) continue;
+          }
+          weapon.abilities = weapon.abilities || [];
+          weapon.abilities.push(makeWeaponReroll(marker));
+        }
+      }
+    }
   }
 
   const unitId = genUUID();

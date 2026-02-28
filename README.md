@@ -1,5 +1,8 @@
 # Daimon
 
+Date Created: 2026-02-22
+Date Updated: 2026-02-28
+
 **Army List → UnitCrunch Converter for Warhammer 40,000 (10th Edition)**
 
 **[→ Use it now](https://lostwhen.github.io/daimon/)**
@@ -58,14 +61,15 @@ Everything that UnitCrunch can simulate is extracted and mapped automatically.
 | Ability | How It's Mapped |
 |---|---|
 | Invulnerable saves | Set on model type; extracted from Invuln profiles and description text; distinguishes bearer-only vs unit-wide |
-| Feel No Pain | Standard FNP and conditional (psychic, mortal wounds) |
-| Rerolls (hit/wound) | Reroll 1s and reroll all failed; leader aura patterns detected |
-| Stat modifiers | +1/−1 to hit, wound, save, damage, strength, toughness |
+| Feel No Pain | Standard FNP and conditional (psychic, mortal wounds); unconditional FNP also set on model-level `ignore` field for sim activation |
+| Rerolls (hit/wound/damage) | All 8 reroll types: reroll 1s, reroll all failed, reroll one failed, reroll range (1-4, 1-5), and reroll damage variants; injected at weapon-level for UnitCrunch sim compatibility; conditional rerolls (ranged/melee only) and base+upgrade pairs supported |
+| Stat modifiers | +1/−1 to hit, wound, save, damage, strength, toughness; attack-type-restricted where applicable |
 | Critical hit/wound effects | Threshold changes (5+), extra hits on crits, lethal/devastating on crits |
 | Damage reduction | −1 damage, halve damage |
 | Benefit of Cover | Detected from description text |
 | Conditional abilities | "Once per battle" / "until end of phase" → start inactive; user toggles on in UC |
 | Leader auras | "While this model is leading a unit" → start active |
+| Select-one abilities | All options emitted as toggleable profile abilities with "select ONE" warning; user enables the one they want |
 | Pre-bake annotations | Equipment and conditional ability bonuses baked into stats by BSData → flagged as informational notes |
 
 ---
@@ -97,12 +101,13 @@ Automated field-by-field verification against Wahapedia CSV data exports using a
 | Drukhari | 37 | 34/37 (92%) | 29 | 0 |
 | Chaos Daemons | 74 | 74/74 (100%) | 17 | 0 |
 | Space Marines | 91 | 91/91 (100%) | 20 | 0 |
+| Ultramarines (SM) | 91 | 91/91 (100%) | 20 | 0 |
 | Chaos Space Marines | 55 | 55/55 (100%) | 17 | 0 |
-| **Total** | **400** | **397/400 (99%)** | **109** | **0** |
+| **Total** | **491** | **488/491 (99%)** | **129** | **0** |
 
-**0 converter bugs found across 400 profiles, 7 factions, 2 list builders.**
+**0 converter bugs found across 491 profiles, 8 factions, 2 list builders.**
 
-All 109 discrepancies were classified into three categories — none are converter errors:
+All 129 discrepancies were classified into three categories — none are converter errors:
 - **BSData↔Wahapedia source disagreements** — BSData and Wahapedia occasionally differ on specific stat values. BSData is typically more current, reflecting recent dataslate and FAQ updates before Wahapedia catches up.
 - **BSData pre-baked conditional bonuses** — BSData bakes certain loadout-dependent stat modifiers (e.g., mark-specific buffs, conditional attack bonuses) directly into weapon profiles. These appear as "wrong" values against Wahapedia's base stats but are correct for that specific loadout.
 - **Harness matching limitations** — Cross-faction units, dual-profile weapon sub-profile selection, and multi-character mixed stat lines cause false positives in the automated comparison.
@@ -157,7 +162,7 @@ Combined NR: 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zer
 
 ## Technical Details
 
-- Single HTML file (~102KB), zero external dependencies
+- Single HTML file (~108KB), zero external dependencies
 - Runs entirely client-side in the browser
 - Output uses msgpack binary encoding matching UnitCrunch's native import/export format
 - `appVersion` field set to `0.73.17` (UC validates this against known version strings; arbitrary values cause silent rejection)
@@ -174,6 +179,40 @@ Combined NR: 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zer
 ---
 
 ## Version History
+
+### v0.76.0
+**PRJ-025: UnitCrunch import format overhaul.**
+
+Complete rework of how Daimon structures profile and weapon abilities for UnitCrunch's simulation engine. Previously, abilities imported and displayed correctly in UnitCrunch's UI but were structurally incompatible with the sim engine's parser, producing incorrect or no simulation results for many ability types.
+
+What changed:
+- **Description grammar** — UnitCrunch rebuilds ability conditions and effects from the `description` field on import, not from the alias name or JSON structure. All 13 non-reroll ability parsers now emit UC-compatible grammar strings (e.g., `"+1 to hit roll (ranged only) (if attacker)"`).
+- **JSON structure alignment** — Conditions and effects restructured to match UnitCrunch's internal format exactly. Profile role conditions use plain strings, scope set to `["profile"]`, and all field names match UC's dropdown schema.
+- **Critical threshold restructure** — Profile-level crit thresholds and weapon-level Anti-X keywords converted from `modifyAbsolute` (which silently fails on UC import/export round-trips) to `attackStepRoll` condition + `overrideReqs` effect. Anti-X `crit: true` flag enables correct Devastating Wounds interaction.
+- **AP operator fix** — Offensive AP uses `"Improve by"/"improve"`, defensive AP uses `"Degrade by"/"degrade"`. Previously used generic `"Add"`/`"Subtract"` operators which UC ignores for AP.
+- **Reroll relocation to weapon-level** — UnitCrunch only supports reroll abilities on weapons, not at profile level. All 8 reroll parsers converted to a two-pass architecture: parsers emit marker objects, post-processing injects rerolls into each matching weapon's abilities array. Deduplication prevents identical rerolls from stacking.
+
+Reroll types supported: reroll all possible failed (hit/wound), reroll results of 1 (hit/wound/damage), reroll one possible failed (hit/wound), reroll range 1-4 and 1-5 (hit/wound), full reroll damage. Conditional rerolls (ranged-only, melee-only) and base+upgrade pairs (e.g., Legionaries with conditional + unconditional rerolls on the same weapon) are handled correctly.
+
+Regression: 10 faction files, 453 profiles, 664 profile abilities, 462 weapon-level rerolls, 0 errors. All reroll types verified functional in UnitCrunch via analytical expected value vs. sim output comparison.
+
+Also bundled: PRJ-023 Stealth duplicate fix (case-insensitive check prevents `parseStealth` and `parseDefensiveHitMod` from both firing on the same rule text).
+
+### v0.75.1
+**Profile ability fix.**
+
+Critical fix — every profile ability Daimon generated was inert in UnitCrunch's simulation engine. Abilities imported, displayed in the UI with correct names, and could be toggled on/off, but produced zero simulation effect.
+
+Root cause: UnitCrunch requires a `profileRole` condition (`"Attacker"` or `"Defender"`) with `preselected: true` on every profile ability for the sim engine to evaluate it. Without this condition, the ability is stored and displayed but never registered with the simulation. Confirmed by adding only the `profileRole` condition to a Daimon-generated ability in UC's editor and observing damage jump from 6.0 to 9.0 (Sustained Hits D3 on Lord of Change).
+
+What was fixed:
+- **profileRole condition** added to all 47 ability call sites (34 attacker, 13 defender) via gatekeeper pattern in `makeUnitAbility`
+- **Model-level FNP** — unconditional Feel No Pain now populates the model-type `ignore` field, which is what UnitCrunch's sim actually reads for FNP. Conditional FNPs (vs. psychic, vs. mortal wounds) remain as profile abilities with correct conditions.
+- **Weapon-specific ability targeting** — abilities referencing specific weapons by name (e.g., "this model's Bolt of Change has [SUSTAINED HITS D3]") are placed on the matching weapon only, not applied to all weapons via a profile ability.
+- **Select-one abilities** (Master of Magicks, Harbinger of Death, Cruel Amusement) — all options emitted as toggleable profile abilities with `aliasActive: false` and a "select ONE" warning alias. User enables the one they want in UnitCrunch's checkbox UI.
+- **BSData `➤` prefix** in weapon names (used for enhancement-granted weapons) no longer breaks weapon-specific ability targeting.
+
+Verified: 237 profiles across 6 factions, 380/380 profileRole compliance, 0 errors.
 
 ### v0.74.1
 **Pre-bake annotation system (Phase 1).**
