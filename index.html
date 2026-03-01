@@ -88,7 +88,7 @@
 <body>
 
 <h1>Daimon</h1>
-<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.78.0</p>
+<p class="subtitle">BSData &rarr; UnitCrunch Converter &middot; Drop a ListForge / New Recruit JSON export to convert &middot; v0.79.0</p>
 
 <div id="drop-zone">
   <div class="icon">&#128196;</div>
@@ -100,7 +100,7 @@
 
 <div id="footer">
   <p class="compat">
-    Daimon v0.78.0 &middot;
+    Daimon v0.79.0 &middot;
     Compatible with <a href="https://listforge.club" target="_blank" rel="noopener">ListForge</a> v2.1 &middot;
     <a href="https://www.unitcrunch.com" target="_blank" rel="noopener">UnitCrunch</a> 0.73.17
   </p>
@@ -581,10 +581,6 @@ function makeUnitAbility(aliasLabel, descriptionGrammar, role, conditions, effec
 // Determines if an ability should be baked directly into weapon stats.
 // Only self-applying, always-on abilities qualify.
 function isStatBakeCandidate(desc) {
-  // Aura: "While a friendly [X] unit is within N" of this model" → always true for bearer
-  if (/while\s+(?:a\s+)?friendly\s+.*?unit\s+is\s+within\s+\d+"?\s*of\s+this\s+model/i.test(desc)) {
-    return true;
-  }
   // Direct self-targeting with no conditional language
   if (/(?:models? in this unit|this model'?s|this unit'?s|equipped by models? in this unit)/i.test(desc)) {
     if (!hasConditionalLanguage(desc)) return true;
@@ -1135,6 +1131,7 @@ const ABILITY_PARSERS = [
         conditions,
         ucModifyRelativeEffect("Strength", "strength", "Add", "add", val)
       );
+      if (/(?:friendly|other|within \d+"|Aura)/i.test(desc)) ability.aliasActive = false;
       if (isStatBakeCandidate(desc)) {
         ability._bakeable = true;
         ability._bakeStat = "strength";
