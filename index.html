@@ -919,13 +919,15 @@ const ABILITY_PARSERS = [
     const m = name.match(/^Damaged:\s*(\d+)-(\d+)\s*wounds?\s*remaining$/i);
     if (!m) return null;
     if (/subtract 1 from the Hit roll/i.test(desc)) {
-      return makeUnitAbility(
+      const ability = makeUnitAbility(
         `Damaged: ${m[1]}-${m[2]} wounds remaining`,
         "-1 to hit roll (if attacker)",
         "attacker",
         [],
         ucModifyRelativeEffect("Hit roll", "hitRoll", "Subtract", "subtract", 1)
       );
+      ability.aliasActive = false;
+      return ability;
     }
     return null;
   },
@@ -2444,6 +2446,12 @@ function parseWeaponProfile(profile, weaponType) {
     id: genUUID()
   };
 
+  // UC enforces 50-char max on weapon names in edit UI; cap at 48 for safety
+  if (weapon.nameUnique.length > 48) {
+    weapon.name = weapon.name.slice(0, 47) + "\u2026";
+    weapon.nameUnique = weapon.name;
+  }
+
   return weapon;
 }
 
@@ -2749,6 +2757,36 @@ function processSelectionUnit(selection) {
     }
   }
 
+  // ── Variant weapon name fitting (48-char UC budget) ──────────────────────────
+  const SELECT_ONE_ABBREVIATIONS = {
+    "Master of Magicks": "MoM",
+    "Cruel Amusement": "CA",
+    "Harbinger of Death": "HoD",
+    "Martial Ka'tah": "MK"
+  };
+  const VARIANT_NAME_MAX = 48;
+
+  function fitVariantWeaponName(weaponName, abilityName, optionName) {
+    // Level 1: {weapon} ({abbrev}: {option})
+    const abbrev = SELECT_ONE_ABBREVIATIONS[abilityName];
+    if (abbrev) {
+      const l1 = `${weaponName} (${abbrev}: ${optionName})`;
+      if (l1.length <= VARIANT_NAME_MAX) return l1;
+    } else {
+      console.warn(`[Daimon] No abbreviation for select-one ability "${abilityName}" — falling through to Level 2`);
+    }
+    // Level 2: {weapon} ({option})
+    const l2 = `${weaponName} (${optionName})`;
+    if (l2.length <= VARIANT_NAME_MAX) return l2;
+    // Level 3: {weapon_truncated}… ({option})
+    const suffix = ` (${optionName})`;
+    const available = VARIANT_NAME_MAX - suffix.length - 1; // 1 for ellipsis
+    if (available < 10) {
+      console.warn(`[Daimon] Variant name truncation leaves <10 chars for weapon: "${weaponName}" option "${optionName}"`);
+    }
+    return `${weaponName.slice(0, Math.max(available, 10))}\u2026${suffix}`;
+  }
+
   // ── Select-one weapon variants: duplicate weapons with baked-in keyword ──────
   // Markers emitted by parseBracketKeywordsInText for "select one of" abilities.
   // For each option, create a copy of the target weapon(s) with the chosen keyword baked in.
@@ -2899,7 +2937,7 @@ function processSelectionUnit(selection) {
           // Deep copy the base weapon
           const variant = JSON.parse(JSON.stringify(weapon));
           variant.id = genUUID();
-          variant.name = `${weapon.name} (${marker._selectOneName}: ${built.displayName})`;
+          variant.name = fitVariantWeaponName(weapon.name, marker._selectOneName, built.displayName);
           variant.nameUnique = variant.name;
 
           // Append the keyword ability
@@ -2914,8 +2952,7 @@ function processSelectionUnit(selection) {
 
           // Insert variant into the same model type's weapons array
           modelType.weapons.push(variant);
-          // Track in selected weapons
-          (variant.type === "Melee" ? allWeaponsMelee : allWeaponsRanged).push(variant.id);
+          // Variants are NOT added to weapons_selected — they import unchecked
         }
       }
     }
