@@ -1,7 +1,7 @@
 # Daimon
 
 Date Created: 2026-02-22
-Date Updated: 2026-02-28
+Date Updated: 2026-03-03 UTC
 
 **Army List → UnitCrunch Converter for Warhammer 40,000 (10th Edition)**
 
@@ -69,7 +69,7 @@ Everything that UnitCrunch can simulate is extracted and mapped automatically.
 | Benefit of Cover | Detected from description text |
 | Conditional abilities | "Once per battle" / "until end of phase" → start inactive; user toggles on in UC |
 | Leader auras | "While this model is leading a unit" → start active |
-| Select-one abilities | All options emitted as toggleable profile abilities with "select ONE" warning; user enables the one they want |
+| Select-one abilities | All options emitted as weapon variants; user toggles weapons on/off in UC sim screen |
 | Pre-bake annotations | Equipment and conditional ability bonuses baked into stats by BSData → flagged as informational notes |
 
 ---
@@ -91,7 +91,7 @@ Some abilities are game-state-dependent and can't be automatically converted. Af
 
 ### Systematic Verification (Phase 4)
 
-Automated field-by-field verification against Wahapedia CSV data exports using a custom verification harness. Every converted profile is compared against Wahapedia's ground truth for unit stats (M/T/Sv/W/LD/OC/Invuln), weapon profiles (A/BS/WS/S/AP/D), weapon keywords, and parsed abilities. Cross-builder validation confirmed both ListForge and New Recruit produce identical converter output for the same units.
+Automated field-by-field verification against Wahapedia CSV data exports using a custom verification harness. Every converted profile is compared against Wahapedia's ground truth for unit stats (T/Sv/W/Invuln), weapon profiles (A/BS/WS/S/AP/D), weapon keywords, and parsed abilities. Cross-builder validation confirmed both ListForge and New Recruit produce identical converter output for the same units.
 
 | Faction | Profiles Tested | Matched | Discrepancies | Converter Bugs |
 |---|---|---|---|---|
@@ -103,16 +103,21 @@ Automated field-by-field verification against Wahapedia CSV data exports using a
 | Space Marines | 91 | 91/91 (100%) | 20 | 0 |
 | Ultramarines (SM) | 91 | 91/91 (100%) | 20 | 0 |
 | Chaos Space Marines | 55 | 55/55 (100%) | 17 | 0 |
-| **Total** | **491** | **488/491 (99%)** | **129** | **0** |
+| Grey Knights | 26 | 26/26 (100%) | 1 | 0 |
+| Imperial Knights | 21 | 21/21 (100%) | 1 | 0 |
+| Tyranids | 51 | 51/51 (100%) | 0 | 0 |
+| Death Guard | 29 | 29/29 (100%) | 2 | 0 |
+| Orks | 52 | 52/52 (100%) | 39 | 0 |
+| **Total** | **632** | **626/632 (99%)** | **172** | **0** |
 
-**0 converter bugs found across 491 profiles, 8 factions, 2 list builders.**
+**0 converter bugs found across 632 profiles, 13 of ~32 factions, 2 list builders.**
 
-All 129 discrepancies were classified into three categories — none are converter errors:
+All discrepancies were classified into three categories — none are converter errors:
 - **BSData↔Wahapedia source disagreements** — BSData and Wahapedia occasionally differ on specific stat values. BSData is typically more current, reflecting recent dataslate and FAQ updates before Wahapedia catches up.
-- **BSData pre-baked conditional bonuses** — BSData bakes certain loadout-dependent stat modifiers (e.g., mark-specific buffs, conditional attack bonuses) directly into weapon profiles. These appear as "wrong" values against Wahapedia's base stats but are correct for that specific loadout.
-- **Harness matching limitations** — Cross-faction units, dual-profile weapon sub-profile selection, and multi-character mixed stat lines cause false positives in the automated comparison.
+- **BSData pre-baked conditional bonuses** — BSData bakes certain loadout-dependent stat modifiers (e.g., mark-specific buffs, conditional attack bonuses, faction rule invulns) directly into weapon and unit profiles. These appear as "wrong" values against Wahapedia's base stats but are correct for that specific loadout.
+- **Harness matching limitations** — Cross-faction units, dual-profile weapon sub-profile selection, multi-character mixed stat lines, and weapon name disagreements between BSData and Wahapedia cause false positives in the automated comparison.
 
-The 3 unmatched profiles in Drukhari were units that exist in the BSData catalogue but are absent from Wahapedia's CSV data — the harness correctly flagged these as unverifiable rather than erroneously matching them to wrong units.
+The 6 unmatched profiles (3 Drukhari, 3 Ork weapon names) were units or weapons that exist in one source's catalogue but use different names in the other — the harness correctly flagged these as unverifiable rather than erroneously matching them.
 
 ### UnitCrunch Round-Trip Verification
 
@@ -179,6 +184,67 @@ Combined NR: 76 profiles, 188 weapons, 133 abilities, 52 invulnerable saves. Zer
 ---
 
 ## Version History
+
+### v0.80.0
+**UC usability fixes: import state defaults + weapon name limits.**
+
+Three fixes addressing issues found during UnitCrunch import verification of v0.79.0.
+
+**Damaged abilities default inactive.** The "Damaged: X wounds remaining" bracket abilities imported as checked (active), implying the model starts below its wound threshold. They now import unchecked, matching the expected game state of a full-health model. Users toggle them on in UC when the model takes damage.
+
+**Select-one weapon variants import unchecked.** Weapon variants created by the Pass 3 select-one mechanism (e.g., Master of Magicks, Martial Ka'tah, Cruel Amusement) were all included in the sim by default alongside base weapons, double-counting attacks. Variants are now excluded from the `weapons_selected_*` arrays so only base weapons are active on import. Users opt into the variant they want by toggling weapons on/off.
+
+**48-character weapon name limit.** UnitCrunch's edit UI enforces a 50-character maximum on weapon names. Import accepts longer names silently, but users can't save edits to over-limit weapons. Daimon now applies a 48-character safety budget with a three-level fallback naming hierarchy:
+
+1. `{weapon} ({abbrev}: {option})` — e.g., `Bolt of Change - witchfire (MoM: Lethal Hits)`
+2. `{weapon} ({option})` — drops the abbreviation prefix
+3. `{weapon_truncated}… ({option})` — truncates the base weapon name with ellipsis
+
+Abbreviation map covers all current select-one abilities (MoM, CA, HoD, MK). Unknown abilities fall through to Level 2 with a console warning.
+
+Regression: 14 factions, 580 profiles, 0 errors. UC import verified for Lord of Change, Death Jester, and Custodes units.
+
+### v0.79.0
+**Aura stat bake removal.**
+
+Aura abilities that modify weapon stats (e.g., Daemon Lord of Tzeentch granting +1 Strength to ranged attacks for friendly units within range) were being detected by the stat bake system and having their bonuses pre-baked into weapon stat lines. This neutered the ability to a zero-effect annotation and denied users the option to toggle the aura on/off in UnitCrunch.
+
+The fix removes the aura detection path from `isStatBakeCandidate()`. Aura stat modifiers now remain as functional, toggleable profile abilities with correct conditions (profileRole, attackType scope) and `aliasActive: false` (auras start inactive since they depend on positioning context). The self-targeting path for always-on abilities (e.g., "models in this unit" stat mods like Death Guard's Blistering Fusillade) is unchanged and continues to bake correctly.
+
+Units affected: any unit with aura-granted stat modifiers (e.g., Lord of Change +1 Strength ranged). Regression: 14 factions, 580 profiles, 0 errors.
+
+### v0.78.0
+**PRJ-025 Pass 4 (partial): FNP mortal wounds fix + halve damage description fix.**
+
+Two bug fixes for abilities that imported into UnitCrunch but didn't function correctly in simulation.
+
+**Feel No Pain vs mortal wounds:** The conditional FNP parser emitted `Feel no pain N+` (unconditional) instead of `Feel no pain N+ (mortal wounds only)` when the ability text specified mortal-wounds-only FNP. UnitCrunch treated these as full FNP, significantly overstating a unit's defensive durability. Fixed: mortal-only case now emits the correct grammar with a `woundType` condition. Combined psychic + mortal wounds cases (where the FNP applies against either damage type) now emit two separate abilities, since UnitCrunch can't OR across different condition types. Both start inactive for user toggling.
+
+**Halve damage:** The halve-damage parser emitted `Halve damage (if defender)` but UnitCrunch's preset grammar is `Divide damage by 2 (if defender)`. The wrong grammar meant UnitCrunch didn't recognize the ability on import and the sim ignored it. Fixed: description string updated to match UnitCrunch's expected format. The underlying effect structure (modifyRelative with divide operator) was already correct.
+
+Units affected: any unit with FNP vs mortal wounds (e.g., Norn Emissary, Plague Marines) or halve damage (e.g., C'tan Shards, Avatar of Khaine). Regression: 5 factions, zero errors.
+
+### v0.77.0
+**PRJ-025 Pass 3: Select-one weapon variants + Blast/Extra attacks fix.**
+
+Two changes bundled in one commit:
+
+Select-one abilities (where the player picks one weapon keyword from a list each turn) are now expressed as weapon variants. For each option, Daimon creates a copy of the target weapon with the selected keyword ability baked in. The base weapon is preserved for scenarios where no option is active (e.g., Overwatch). Users toggle weapons on/off in UnitCrunch's sim screen to select the active option.
+
+Architecture follows the same two-pass marker pattern as Pass 2: parsers emit marker objects, post-processing creates deep copies of matched weapons with one keyword ability per variant. Naming convention: `{weapon} ({ability}: {option})`, e.g., `Bolt of Change - witchfire (Master of Magicks: Lethal Hits)`.
+
+Select-one abilities converted:
+
+| Ability | Unit | Faction | Options | Variants |
+|---|---|---|---|---|
+| Master of Magicks | Lord of Change | Chaos Daemons | Ignores Cover, Lethal Hits, Sustained Hits D3 | 3 |
+| Cruel Amusement | Death Jester | Aeldari / Drukhari | Ignores Cover, Precision, Sustained Hits 3 | 3 |
+| Harbinger of Death | Daemon Prince w/ Wings | Chaos Daemons | Lethal Hits, Precision, Sustained Hits 1 | 3 |
+| Martial Ka'tah | All Custodes units | Custodes | Sustained Hits 1, Lethal Hits | 56 |
+
+Also fixed: Blast and Extra Attacks `KEYWORD_ABILITY_MAP` entries updated with correct `data.option` objects. Previously both had `data: {}`, meaning UnitCrunch's sim didn't recognize them.
+
+Regression: 10 factions, 453 profiles, 74 weapon variants created, 0 select-one annotations remaining, 0 errors.
 
 ### v0.76.0
 **PRJ-025: UnitCrunch import format overhaul.**
